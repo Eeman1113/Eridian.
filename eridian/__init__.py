@@ -21,6 +21,12 @@ from .logging import (
 )
 from .camera import CameraManager, CameraDevice
 from .depth import DepthEstimator, DepthEstimatorFactory
+from .depth_enhanced import (
+    MultiModelDepthEstimator,
+    ModelRegistry,
+    ModelSpec,
+    BaseDepthEstimator,
+)
 from .slam import PoseTracker, SLAMPipeline
 from .splat import SplatBuilder, SplatManager
 from .spatial import SpatialHash, Octree, OctreeNode
@@ -50,6 +56,10 @@ __all__ = [
     # Depth
     'DepthEstimator',
     'DepthEstimatorFactory',
+    'MultiModelDepthEstimator',
+    'ModelRegistry',
+    'ModelSpec',
+    'BaseDepthEstimator',
     
     # SLAM
     'PoseTracker',
