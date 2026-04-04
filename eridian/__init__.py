@@ -30,6 +30,13 @@ from .depth_enhanced import (
 from .slam import PoseTracker, SLAMPipeline
 from .splat import SplatBuilder, SplatManager
 from .spatial import SpatialHash, Octree, OctreeNode
+from .pipeline import (
+    AsyncPipeline,
+    PipelineBuilder,
+    PipelineStage,
+    PipelineMetrics,
+    FrameData,
+)
 
 __all__ = [
     # Configuration
@@ -73,4 +80,11 @@ __all__ = [
     'SpatialHash',
     'Octree',
     'OctreeNode',
+    
+    # Pipeline
+    'AsyncPipeline',
+    'PipelineBuilder',
+    'PipelineStage',
+    'PipelineMetrics',
+    'FrameData',
 ]
