@@ -19,11 +19,18 @@ from .logging import (
     timer_context,
     error_context,
 )
+from .camera import CameraManager, CameraDevice
+from .depth import DepthEstimator, DepthEstimatorFactory
+from .slam import PoseTracker, SLAMPipeline
+from .splat import SplatBuilder, SplatManager
 
 __all__ = [
+    # Configuration
     'Config',
     'get_config', 
     'reset_config',
+    
+    # Logging
     'EridianLogger',
     'PerformanceMonitor',
     'ErrorHandler',
@@ -34,4 +41,20 @@ __all__ = [
     'safe_execute',
     'timer_context',
     'error_context',
+    
+    # Camera
+    'CameraManager',
+    'CameraDevice',
+    
+    # Depth
+    'DepthEstimator',
+    'DepthEstimatorFactory',
+    
+    # SLAM
+    'PoseTracker',
+    'SLAMPipeline',
+    
+    # Splat
+    'SplatBuilder',
+    'SplatManager',
 ]
