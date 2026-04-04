@@ -23,6 +23,7 @@ from .camera import CameraManager, CameraDevice
 from .depth import DepthEstimator, DepthEstimatorFactory
 from .slam import PoseTracker, SLAMPipeline
 from .splat import SplatBuilder, SplatManager
+from .spatial import SpatialHash, Octree, OctreeNode
 
 __all__ = [
     # Configuration
@@ -57,4 +58,9 @@ __all__ = [
     # Splat
     'SplatBuilder',
     'SplatManager',
+    
+    # Spatial
+    'SpatialHash',
+    'Octree',
+    'OctreeNode',
 ]
