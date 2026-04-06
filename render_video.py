@@ -22,13 +22,13 @@ OUTPUT_DIR = BASE_DIR / "output_video"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_PATH = OUTPUT_DIR / "eridian_demo.mp4"
 
-PANEL_W, PANEL_H = 640, 480  # each panel size
-GRID_W, GRID_H = PANEL_W * 2, PANEL_H * 2  # 2x2 grid
+PANEL_W, PANEL_H = 640, 480
+GRID_W, GRID_H = PANEL_W * 2, PANEL_H * 2
 
 
 def render_pointcloud_view(points, colors, frame_idx, total_frames,
                            width=PANEL_W, height=PANEL_H):
-    """Render the 3D point cloud to a 2D image with a slowly orbiting camera."""
+    """Render the 3D point cloud with depth shading and gentle Z-axis b-roll."""
     canvas = np.zeros((height, width, 3), dtype=np.uint8)
 
     if len(points) < 10:
@@ -47,53 +47,55 @@ def render_pointcloud_view(points, colors, frame_idx, total_frames,
         spread = 1.0
 
     # Gentle Z-axis rotation — slow b-roll drift
-    angle = (frame_idx / max(total_frames, 1)) * math.pi * 0.15  # ~27 degrees over full video
+    angle = (frame_idx / max(total_frames, 1)) * math.pi * 0.15
     cos_a, sin_a = math.cos(angle), math.sin(angle)
 
-    # Rotate around Z axis (screen-plane rotation)
     rx = pts[:, 0] * cos_a - pts[:, 1] * sin_a
-    ry2 = pts[:, 0] * sin_a + pts[:, 1] * cos_a
-    rz2 = pts[:, 2]
+    ry = pts[:, 0] * sin_a + pts[:, 1] * cos_a
+    rz = pts[:, 2]
 
     # Perspective projection
     focal = width * 0.8
     cam_dist = spread * 3.0
-    z_shifted = rz2 + cam_dist
+    z_shifted = rz + cam_dist
 
-    # Filter points behind camera
     valid = z_shifted > 0.1
-    rx, ry2, z_shifted = rx[valid], ry2[valid], z_shifted[valid]
-    cols_valid = colors[valid]
+    rx, ry, z_shifted = rx[valid], ry[valid], z_shifted[valid]
+    cols_valid = colors[valid].astype(np.float32)
 
     if len(rx) == 0:
         return canvas
 
     px = (rx * focal / z_shifted + width / 2).astype(np.int32)
-    py = (-ry2 * focal / z_shifted + height / 2).astype(np.int32)
+    py = (-ry * focal / z_shifted + height / 2).astype(np.int32)
 
-    # Depth sort (draw far points first)
+    # ── Depth shading: farther points are dimmer ───────────────────
+    z_min, z_max = z_shifted.min(), z_shifted.max()
+    z_range = z_max - z_min + 1e-6
+    depth_factor = 1.0 - 0.6 * (z_shifted - z_min) / z_range  # [0.4, 1.0]
+    cols_shaded = cols_valid * depth_factor[:, np.newaxis]
+    cols_shaded = np.clip(cols_shaded, 0, 255).astype(np.uint8)
+
+    # Depth sort (draw far points first, close points on top)
     depth_order = np.argsort(-z_shifted)
     px, py = px[depth_order], py[depth_order]
-    cols_valid = cols_valid[depth_order]
+    cols_shaded = cols_shaded[depth_order]
 
-    # Filter to visible region
-    mask = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+    # Filter to visible region (with margin for point splats)
+    mask = (px >= 1) & (px < width - 1) & (py >= 1) & (py < height - 1)
     px, py = px[mask], py[mask]
-    cols_valid = cols_valid[mask]
+    cols_shaded = cols_shaded[mask]
 
-    # Subsample deterministically (every Nth point) to avoid flicker
-    if len(px) > 200000:
-        step = max(1, len(px) // 200000)
-        px, py, cols_valid = px[::step], py[::step], cols_valid[::step]
+    # Deterministic subsample to avoid flicker
+    if len(px) > 250000:
+        step = max(1, len(px) // 250000)
+        px, py, cols_shaded = px[::step], py[::step], cols_shaded[::step]
 
-    # Draw points (BGR format for OpenCV)
-    canvas[py, px] = cols_valid[:, ::-1]  # RGB -> BGR
-
-    # Also draw neighboring pixels for visibility
-    for dx, dy in [(1, 0), (0, 1), (1, 1)]:
-        px2, py2 = px + dx, py + dy
-        m = (px2 < width) & (py2 < height)
-        canvas[py2[m], px2[m]] = cols_valid[m][:, ::-1]
+    # ── Draw 3x3 point splats for visibility ───────────────────────
+    bgr = cols_shaded[:, ::-1]  # RGB -> BGR
+    for dx in range(-1, 2):
+        for dy in range(-1, 2):
+            canvas[py + dy, px + dx] = bgr
 
     return canvas
 
@@ -108,10 +110,9 @@ def add_label(panel, label, bg_color=(0, 0, 0)):
 
 def main():
     log.info("=" * 60)
-    log.info("Rendering 4-panel demo video")
+    log.info("Rendering 4-panel demo video (v2)")
     log.info("=" * 60)
 
-    # Open input video
     cap = cv2.VideoCapture(str(INPUT_VIDEO))
     if not cap.isOpened():
         log.error(f"Cannot open {INPUT_VIDEO}")
@@ -121,11 +122,9 @@ def main():
     in_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     log.info(f"Input: {INPUT_VIDEO.name}, {total_frames} frames @ {in_fps:.0f}fps")
 
-    # Output video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(str(OUTPUT_PATH), fourcc, in_fps, (GRID_W, GRID_H))
 
-    # Init components
     log.info("Loading depth model...")
     depth_est = DepthEstimator()
 
@@ -136,13 +135,16 @@ def main():
     pose_est = PoseEstimator(K_fx, K_fx, PANEL_W / 2, PANEL_H / 2)
     cloud = PointCloud()
 
+    # Keyframe state for render pipeline
+    last_kf_pose = np.eye(4)
+    frames_since_kf = 0
+
     frame_idx = 0
     t_start = time.time()
 
-    # Cache for stable 3D rendering — only update every N frames
-    cached_pts, cached_cols = np.zeros((0, 3), dtype=np.float32), np.zeros((0, 3), dtype=np.uint8)
-    cached_p4 = np.zeros((PANEL_H, PANEL_W, 3), dtype=np.uint8)
-    cloud_update_interval = 5  # update 3D panel every 5 frames
+    cached_pts = np.zeros((0, 3), dtype=np.float32)
+    cached_cols = np.zeros((0, 3), dtype=np.uint8)
+    cloud_update_interval = 5
 
     while True:
         ok, raw_frame = cap.read()
@@ -166,11 +168,19 @@ def main():
             pose = np.eye(4)
             matches_img = frame.copy()
 
-        # ── Point cloud ────────────────────────────────────────────
-        try:
-            cloud.add_frame(depth, frame, pose, K)
-        except Exception:
-            pass
+        # ── Keyframe-gated point cloud accumulation ────────────────
+        frames_since_kf += 1
+        t_diff = np.linalg.norm(pose[:3, 3] - last_kf_pose[:3, 3])
+        R_diff = pose[:3, :3] @ last_kf_pose[:3, :3].T
+        angle_diff = np.arccos(np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0))
+
+        if t_diff > 0.08 or angle_diff > np.radians(5) or frames_since_kf > 10:
+            try:
+                cloud.add_frame(depth, frame, pose, K)
+            except Exception:
+                pass
+            last_kf_pose = pose.copy()
+            frames_since_kf = 0
 
         # ── Build 4 panels ─────────────────────────────────────────
         elapsed = time.time() - t_start
@@ -187,16 +197,16 @@ def main():
         # Panel 2: Depth map
         d_norm = ((depth - depth.min()) / (depth.max() - depth.min() + 1e-6) * 255).astype(np.uint8)
         p2 = cv2.applyColorMap(d_norm, cv2.COLORMAP_INFERNO)
-        p2 = add_label(p2, "DEPTH")
+        p2 = add_label(p2, "DEPTH (metric)")
 
         # Panel 3: Features
         p3 = matches_img.copy()
         cv2.putText(p3, f"Tracking: {'OK' if pose_est.tracking else 'LOST'}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 0) if pose_est.tracking else (0, 0, 255), 2)
-        p3 = add_label(p3, "FEATURES")
+        p3 = add_label(p3, "OPTICAL FLOW + PnP")
 
-        # Panel 4: 3D point cloud — update snapshot every N frames for stability
+        # Panel 4: 3D point cloud — cached for stability
         if frame_idx % cloud_update_interval == 1 or frame_idx == 1:
             cached_pts, cached_cols = cloud.get_data()
         p4 = render_pointcloud_view(cached_pts, cached_cols, frame_idx, total_frames)
@@ -204,14 +214,11 @@ def main():
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         p4 = add_label(p4, "3D POINT CLOUD")
 
-        # ── Compose 2x2 grid ──────────────────────────────────────
+        # ── Compose ────────────────────────────────────────────────
         top = np.hstack([p1, p2])
         bot = np.hstack([p3, p4])
-        grid = np.vstack([top, bot])
+        out.write(np.vstack([top, bot]))
 
-        out.write(grid)
-
-        # Progress
         if frame_idx % 10 == 0 or frame_idx == total_frames:
             pct = frame_idx / total_frames * 100
             log.info(f"  [{pct:5.1f}%] Frame {frame_idx}/{total_frames} | "

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-3D World Mapper — Real-time monocular 3D point cloud reconstruction.
+Eridian — Real-time monocular 3D point cloud reconstruction.
 
-Uses webcam + monocular depth estimation + visual odometry to build
+Uses webcam + metric depth estimation + PnP visual odometry to build
 a colored 3D point cloud of the environment in real time.
 """
 
 import argparse
-import os
 import sys
 import time
 import signal
@@ -59,16 +58,13 @@ class CameraCapture:
         self._open()
 
     def _open(self):
-        # If video path given, use it directly
         if self.video_path:
             return self._open_video(self.video_path)
 
-        # Try cameras first
         for idx in (0, 1, 2):
             log.info(f"Trying camera index {idx}...")
             cap = cv2.VideoCapture(idx)
             if cap.isOpened():
-                # Try reading a frame to confirm it actually works
                 ok, _ = cap.read()
                 if ok:
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
@@ -80,7 +76,6 @@ class CameraCapture:
                     return
             cap.release()
 
-        # No camera — fall back to test video
         log.warning("No camera found, looking for test video...")
         if TEST_VIDEO.exists():
             self._open_video(str(TEST_VIDEO))
@@ -103,7 +98,6 @@ class CameraCapture:
             self.cap = None
 
     def read(self):
-        """Returns (ok, frame). Loops video in test mode."""
         if self.cap is None or not self.cap.isOpened():
             if not self.is_video:
                 log.warning("Camera disconnected, attempting reconnect...")
@@ -129,7 +123,6 @@ class CameraCapture:
             if self.cap is not None:
                 ok, frame = self.cap.read()
 
-        # Resize to target resolution for consistency
         if ok and frame is not None:
             h, w = frame.shape[:2]
             if w != self.width or h != self.height:
@@ -143,15 +136,16 @@ class CameraCapture:
 
 
 # ============================================================================
-# 2. MONOCULAR DEPTH ESTIMATION
+# 2. MONOCULAR DEPTH ESTIMATION (with bilateral + temporal smoothing)
 # ============================================================================
 class DepthEstimator:
-    """Depth Anything V2 metric (small) via transformers, with fallbacks."""
+    """Depth Anything V2 Metric with bilateral filtering and temporal EMA."""
 
     def __init__(self):
         self.pipe = None
         self.model_name = None
         self.is_metric = False
+        self.prev_depth = None
         self._load_model()
 
     def _load_model(self):
@@ -159,7 +153,6 @@ class DepthEstimator:
 
         device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-        # Metric models first (output real meters), then relative fallbacks
         candidates = [
             ("depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf", True),
             ("depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf", True),
@@ -170,11 +163,7 @@ class DepthEstimator:
         for name, metric in candidates:
             try:
                 log.info(f"Loading depth model: {name}")
-                self.pipe = pipeline(
-                    "depth-estimation",
-                    model=name,
-                    device=device,
-                )
+                self.pipe = pipeline("depth-estimation", model=name, device=device)
                 self.model_name = name
                 self.is_metric = metric
                 log.info(f"Depth model loaded: {name} ({'METRIC' if metric else 'relative'})")
@@ -185,7 +174,7 @@ class DepthEstimator:
         raise RuntimeError("Could not load any depth estimation model")
 
     def estimate(self, frame_bgr):
-        """Returns depth map as float32 HxW array in meters."""
+        """Returns depth map as float32 HxW array in meters, filtered and smoothed."""
         from PIL import Image as PILImage
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -193,8 +182,6 @@ class DepthEstimator:
 
         result = self.pipe(pil_img)
 
-        # Metric models: use predicted_depth tensor (actual meters)
-        # Relative models: use depth PIL image and normalize to fake meters
         if self.is_metric and "predicted_depth" in result:
             depth = result["predicted_depth"]
             if hasattr(depth, 'cpu'):
@@ -206,128 +193,202 @@ class DepthEstimator:
                 depth = np.array(depth_raw, dtype=np.float32)
             else:
                 depth = np.array(depth_raw, dtype=np.float32)
-            # Normalize relative depth to approximate meters
             d_min, d_max = depth.min(), depth.max()
             if d_max - d_min > 1e-6:
                 depth = (depth - d_min) / (d_max - d_min)
-            depth = 0.5 + depth * 9.5  # [0.5, 10.0] meters
+            depth = 0.5 + depth * 9.5
 
-        # Resize to match input frame
         h, w = frame_bgr.shape[:2]
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
+
+        # ── Bilateral filter: smooth noise, preserve edges ─────────
+        depth = cv2.bilateralFilter(depth, d=7, sigmaColor=0.3, sigmaSpace=7)
+
+        # ── Temporal EMA: reduce per-frame jitter ──────────────────
+        alpha = 0.65
+        if self.prev_depth is not None and self.prev_depth.shape == depth.shape:
+            depth = alpha * depth + (1.0 - alpha) * self.prev_depth
+        self.prev_depth = depth.copy()
 
         return depth
 
 
 # ============================================================================
-# 3. CAMERA POSE ESTIMATION (Visual Odometry)
+# 3. POSE ESTIMATION (GFTT + Lucas-Kanade + PnP)
 # ============================================================================
 class PoseEstimator:
-    """ORB-based frame-to-frame visual odometry."""
+    """Visual odometry using optical flow tracking and PnP from depth."""
 
     def __init__(self, fx, fy, cx, cy):
         self.K = np.array([[fx, 0, cx],
                            [0, fy, cy],
                            [0,  0,  1]], dtype=np.float64)
-        self.orb = cv2.ORB_create(nfeatures=1000)
-        self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        self.fx, self.fy = fx, fy
+        self.cx, self.cy = cx, cy
+
+        # GFTT corner detection params
+        self.gftt_params = dict(
+            maxCorners=500, qualityLevel=0.01,
+            minDistance=15, blockSize=7,
+        )
+
+        # Lucas-Kanade optical flow params
+        self.lk_params = dict(
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+
         self.prev_gray = None
-        self.prev_kp = None
-        self.prev_des = None
-        self.pose = np.eye(4, dtype=np.float64)  # world pose (camera-to-world)
+        self.prev_pts = None
+        self.prev_depth = None
+        self.pose = np.eye(4, dtype=np.float64)
         self.tracking = True
+        self.frame_count = 0
 
     def update(self, frame_bgr, depth=None):
-        """Update pose from new frame. Returns (pose_4x4, keypoints, matches_img).
-        If depth is provided (metric), uses it to scale the translation vector."""
+        """Update pose via LK optical flow + PnP. Returns (pose, kp_list, viz_img)."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        kp, des = self.orb.detectAndCompute(gray, None)
+        self.frame_count += 1
 
-        matches_img = cv2.drawKeypoints(frame_bgr, kp, None,
-                                        color=(0, 255, 0),
-                                        flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+        viz = frame_bgr.copy()
 
-        if self.prev_des is None or des is None or len(kp) < 8:
+        # ── Detect features if needed ──────────────────────────────
+        if self.prev_pts is None or len(self.prev_pts) < 80 or self.frame_count % 30 == 0:
+            pts = cv2.goodFeaturesToTrack(gray, **self.gftt_params)
+            if pts is None:
+                self.prev_gray = gray
+                self.prev_pts = None
+                self.prev_depth = depth
+                return self.pose.copy(), [], viz
+
             self.prev_gray = gray
-            self.prev_kp = kp
-            self.prev_des = des
-            return self.pose.copy(), kp, matches_img
+            self.prev_pts = pts
+            self.prev_depth = depth
 
-        # Match features
-        raw_matches = self.bf.knnMatch(self.prev_des, des, k=2)
+            # Draw detected features
+            for p in pts:
+                x, y = int(p[0, 0]), int(p[0, 1])
+                cv2.circle(viz, (x, y), 3, (0, 255, 0), -1)
 
-        # Lowe's ratio test
-        good = []
-        for m_pair in raw_matches:
-            if len(m_pair) == 2:
-                m, n = m_pair
-                if m.distance < 0.75 * n.distance:
-                    good.append(m)
+            return self.pose.copy(), [], viz
 
-        if len(good) < 15:
-            log.warning(f"Tracking: only {len(good)} matches, holding pose")
+        # ── Track features with LK optical flow ───────────────────
+        pts_next, status, err = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, self.prev_pts, None, **self.lk_params
+        )
+
+        if pts_next is None:
             self.tracking = False
             self.prev_gray = gray
-            self.prev_kp = kp
-            self.prev_des = des
-            return self.pose.copy(), kp, matches_img
+            self.prev_pts = None
+            self.prev_depth = depth
+            return self.pose.copy(), [], viz
 
-        # Extract matched points
-        pts1 = np.float64([self.prev_kp[m.queryIdx].pt for m in good])
-        pts2 = np.float64([kp[m.trainIdx].pt for m in good])
+        # ── Forward-backward consistency check ─────────────────────
+        pts_back, status_back, _ = cv2.calcOpticalFlowPyrLK(
+            gray, self.prev_gray, pts_next, None, **self.lk_params
+        )
 
-        # Essential matrix
-        E, mask = cv2.findEssentialMat(pts1, pts2, self.K,
-                                       method=cv2.RANSAC,
-                                       prob=0.999, threshold=1.0)
-        if E is None:
+        status = status.ravel().astype(bool)
+        if pts_back is not None:
+            status_back = status_back.ravel().astype(bool)
+            fb_err = np.linalg.norm(
+                self.prev_pts.reshape(-1, 2) - pts_back.reshape(-1, 2), axis=1
+            )
+            # Keep only points that survived both directions with < 1px round-trip error
+            good_mask = status & status_back & (fb_err < 1.0)
+        else:
+            good_mask = status
+
+        prev_good = self.prev_pts[good_mask].reshape(-1, 2)
+        curr_good = pts_next[good_mask].reshape(-1, 2)
+
+        # ── Draw optical flow trails ───────────────────────────────
+        for i in range(len(curr_good)):
+            x0, y0 = int(prev_good[i, 0]), int(prev_good[i, 1])
+            x1, y1 = int(curr_good[i, 0]), int(curr_good[i, 1])
+            cv2.line(viz, (x0, y0), (x1, y1), (0, 255, 255), 1)
+            cv2.circle(viz, (x1, y1), 2, (0, 255, 0), -1)
+
+        if len(prev_good) < 10:
+            log.warning(f"Tracking: only {len(prev_good)} points after FB check")
             self.tracking = False
             self.prev_gray = gray
-            self.prev_kp = kp
-            self.prev_des = des
-            return self.pose.copy(), kp, matches_img
+            self.prev_pts = cv2.goodFeaturesToTrack(gray, **self.gftt_params)
+            self.prev_depth = depth
+            return self.pose.copy(), [], viz
 
-        _, R, t, mask2 = cv2.recoverPose(E, pts1, pts2, self.K)
+        # ── PnP pose from depth ────────────────────────────────────
+        if self.prev_depth is not None:
+            # Lift previous 2D points to 3D using depth
+            px = np.clip(prev_good[:, 0].astype(int), 0, self.prev_depth.shape[1] - 1)
+            py = np.clip(prev_good[:, 1].astype(int), 0, self.prev_depth.shape[0] - 1)
+            z = self.prev_depth[py, px]
 
-        # Scale translation using depth if available
-        # recoverPose returns unit translation — scale it by median depth
-        # so camera motion is proportional to scene depth
-        t_scaled = t.ravel()
-        if depth is not None:
-            median_depth = float(np.median(depth[depth > 0.1]))
-            t_scaled = t_scaled * median_depth * 0.01  # conservative scale factor
+            # Filter valid depth
+            valid = (z > 0.2) & (z < 12.0)
+            if valid.sum() < 8:
+                self.tracking = False
+                self.prev_gray = gray
+                self.prev_pts = cv2.goodFeaturesToTrack(gray, **self.gftt_params)
+                self.prev_depth = depth
+                return self.pose.copy(), [], viz
 
-        # Build relative transform
-        T_rel = np.eye(4, dtype=np.float64)
-        T_rel[:3, :3] = R
-        T_rel[:3, 3] = t_scaled
+            z_valid = z[valid]
+            prev_2d = prev_good[valid]
+            curr_2d = curr_good[valid]
 
-        # Accumulate pose
-        self.pose = self.pose @ np.linalg.inv(T_rel)
-        self.tracking = True
+            # Back-project to 3D camera coords (previous frame)
+            x3d = (prev_2d[:, 0] - self.cx) * z_valid / self.fx
+            y3d = (prev_2d[:, 1] - self.cy) * z_valid / self.fy
+            pts_3d = np.stack([x3d, y3d, z_valid], axis=1).astype(np.float64)
+            pts_2d = curr_2d.astype(np.float64)
 
-        # Draw matches on image
-        if self.prev_kp is not None:
-            match_pairs = [(self.prev_kp[m.queryIdx].pt, kp[m.trainIdx].pt) for m in good[:50]]
-            for (x1, y1), (x2, y2) in match_pairs:
-                cv2.line(matches_img, (int(x2), int(y2)), (int(x1), int(y1)),
-                         (0, 255, 255), 1)
+            # Solve PnP — gives pose of current frame relative to previous 3D points
+            ok, rvec, tvec, inliers = cv2.solvePnPRansac(
+                pts_3d, pts_2d, self.K, None,
+                iterationsCount=200, reprojectionError=3.0,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
 
+            if ok and inliers is not None and len(inliers) >= 8:
+                R, _ = cv2.Rodrigues(rvec)
+                T_rel = np.eye(4, dtype=np.float64)
+                T_rel[:3, :3] = R
+                T_rel[:3, 3] = tvec.ravel()
+
+                self.pose = self.pose @ np.linalg.inv(T_rel)
+                self.tracking = True
+
+                # Highlight inliers
+                for idx in inliers.ravel():
+                    if idx < len(curr_2d):
+                        x, y = int(curr_2d[idx, 0]), int(curr_2d[idx, 1])
+                        cv2.circle(viz, (x, y), 4, (255, 0, 255), 1)
+            else:
+                log.warning(f"PnP failed or too few inliers ({0 if inliers is None else len(inliers)})")
+                self.tracking = False
+
+        # ── Update state ───────────────────────────────────────────
+        # Re-detect if too few tracked points
+        if len(curr_good) < 100:
+            self.prev_pts = cv2.goodFeaturesToTrack(gray, **self.gftt_params)
+        else:
+            self.prev_pts = curr_good.reshape(-1, 1, 2).astype(np.float32)
         self.prev_gray = gray
-        self.prev_kp = kp
-        self.prev_des = des
+        self.prev_depth = depth
 
-        return self.pose.copy(), kp, matches_img
+        return self.pose.copy(), [], viz
 
 
 # ============================================================================
-# 4. POINT CLOUD ACCUMULATION
+# 4. POINT CLOUD (with edge/normal filtering + voxel averaging)
 # ============================================================================
 class PointCloud:
-    """Global point cloud with voxel downsampling."""
+    """Global point cloud with depth-edge filtering, normal rejection, and voxel averaging."""
 
-    def __init__(self, max_points=2_000_000, voxel_size=0.05):
+    def __init__(self, max_points=2_000_000, voxel_size=0.03):
         self.points = np.zeros((0, 3), dtype=np.float32)
         self.colors = np.zeros((0, 3), dtype=np.uint8)
         self.max_points = max_points
@@ -336,77 +397,120 @@ class PointCloud:
         self.frame_count = 0
 
     def add_frame(self, depth, frame_bgr, pose, K, subsample=4):
-        """Back-project depth to 3D, transform to world coords, append."""
+        """Back-project depth to 3D with quality filtering, transform, append."""
         h, w = depth.shape
-        # Subsample grid
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        # ── Depth gradients (for edge + normal filtering) ──────────
+        grad_x = cv2.Sobel(depth, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(depth, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+        # ── Subsample grid ─────────────────────────────────────────
         ys = np.arange(0, h, subsample)
         xs = np.arange(0, w, subsample)
         xs, ys = np.meshgrid(xs, ys)
-        xs = xs.ravel()
-        ys = ys.ravel()
+        xs, ys = xs.ravel(), ys.ravel()
 
         z = depth[ys, xs]
+        gm = grad_mag[ys, xs]
 
-        # Filter invalid depth
-        valid = (z > 0.3) & (z < 15.0)
+        # ── Filter 1: valid depth range ────────────────────────────
+        valid = (z > 0.2) & (z < 12.0)
+
+        # ── Filter 2: depth edge rejection ─────────────────────────
+        # Reject points where depth gradient > 15% of depth (flying pixels)
+        edge_thresh = 0.15 * z
+        valid &= (gm < edge_thresh)
+
+        # ── Filter 3: grazing angle rejection via surface normals ──
+        gx = grad_x[ys, xs]
+        gy = grad_y[ys, xs]
+        # Surface normal in camera frame from depth gradients
+        nx = -gx / fx
+        ny = -gy / fy
+        nz = np.ones_like(nx)
+        n_norm = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2) + 1e-8
+        nx, ny, nz = nx / n_norm, ny / n_norm, nz / n_norm
+
+        # Camera ray direction per pixel
+        ray_x = (xs.astype(np.float32) - cx) / fx
+        ray_y = (ys.astype(np.float32) - cy) / fy
+        ray_z = np.ones_like(ray_x)
+        ray_norm = np.sqrt(ray_x ** 2 + ray_y ** 2 + ray_z ** 2)
+        ray_x, ray_y, ray_z = ray_x / ray_norm, ray_y / ray_norm, ray_z / ray_norm
+
+        # Dot product: cos(angle between normal and view ray)
+        cos_angle = np.abs(nx * ray_x + ny * ray_y + nz * ray_z)
+        valid &= (cos_angle > 0.25)  # reject angles > ~75 degrees
+
+        # ── Apply filter ───────────────────────────────────────────
         xs, ys, z = xs[valid], ys[valid], z[valid]
 
-        # Back-project to camera coordinates
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
+        if len(z) < 10:
+            return
+
+        # ── Back-project to 3D camera coords ──────────────────────
         x3d = (xs.astype(np.float32) - cx) * z / fx
         y3d = (ys.astype(np.float32) - cy) * z / fy
-        z3d = z
+        pts_cam = np.stack([x3d, y3d, z], axis=1)
 
-        pts_cam = np.stack([x3d, y3d, z3d], axis=1)  # Nx3
-
-        # Transform to world coordinates
+        # ── Transform to world coordinates ─────────────────────────
         R = pose[:3, :3].astype(np.float32)
         t = pose[:3, 3].astype(np.float32)
         pts_world = (pts_cam @ R.T) + t
 
-        # Get colors (BGR -> RGB)
-        colors = frame_bgr[ys, xs][:, ::-1].copy()  # RGB uint8
+        # ── Colors (BGR -> RGB) ────────────────────────────────────
+        colors = frame_bgr[ys, xs][:, ::-1].copy()
 
         with self.lock:
             self.points = np.vstack([self.points, pts_world])
             self.colors = np.vstack([self.colors, colors])
             self.frame_count += 1
 
-            # Voxel downsample every 30 frames
-            if self.frame_count % 30 == 0:
+            if self.frame_count % 20 == 0:
                 self._voxel_downsample()
 
     def _voxel_downsample(self):
-        """Vectorized voxel grid downsampling using numpy."""
+        """Voxel averaging: merge points in the same voxel by averaging positions and colors."""
         if len(self.points) < 1000:
             return
 
         n_before = len(self.points)
 
-        # Quantize to voxel grid
-        voxel_indices = np.floor(self.points / self.voxel_size).astype(np.int64)
+        voxel_idx = np.floor(self.points / self.voxel_size).astype(np.int64)
+        voxel_idx -= voxel_idx.min(axis=0)
+        dims = voxel_idx.max(axis=0) + 1
+        flat = (voxel_idx[:, 0] * dims[1] * dims[2]
+                + voxel_idx[:, 1] * dims[2]
+                + voxel_idx[:, 2])
 
-        # Pack 3 indices into a single int for fast unique lookup
-        # Shift to positive range first
-        voxel_indices -= voxel_indices.min(axis=0)
-        dims = voxel_indices.max(axis=0) + 1
-        flat = (voxel_indices[:, 0] * dims[1] * dims[2]
-                + voxel_indices[:, 1] * dims[2]
-                + voxel_indices[:, 2])
+        unique_voxels, inverse = np.unique(flat, return_inverse=True)
+        n_voxels = len(unique_voxels)
 
-        _, keep = np.unique(flat, return_index=True)
-        keep.sort()
+        # Average positions and colors per voxel using bincount
+        counts = np.bincount(inverse, minlength=n_voxels).astype(np.float32)
+        avg_pts = np.zeros((n_voxels, 3), dtype=np.float32)
+        avg_cols = np.zeros((n_voxels, 3), dtype=np.float32)
+        for dim in range(3):
+            avg_pts[:, dim] = np.bincount(
+                inverse, weights=self.points[:, dim], minlength=n_voxels
+            ) / counts
+            avg_cols[:, dim] = np.bincount(
+                inverse, weights=self.colors[:, dim].astype(np.float32), minlength=n_voxels
+            ) / counts
 
-        # If still too many, randomly subsample
-        if len(keep) > self.max_points:
-            keep = np.random.choice(keep, self.max_points, replace=False)
-            keep.sort()
+        self.points = avg_pts
+        self.colors = np.clip(avg_cols, 0, 255).astype(np.uint8)
 
-        self.points = self.points[keep]
-        self.colors = self.colors[keep]
+        # If over budget, keep highest-density voxels
+        if len(self.points) > self.max_points:
+            keep = np.argsort(-counts)[:self.max_points]
+            self.points = self.points[keep]
+            self.colors = self.colors[keep]
 
-        log.info(f"Voxel downsample: {n_before} -> {len(self.points)} points")
+        log.info(f"Voxel average: {n_before} -> {len(self.points)} points")
 
     def get_data(self):
         with self.lock:
@@ -417,16 +521,15 @@ class PointCloud:
 
 
 # ============================================================================
-# 5. PLY EXPORT (replaces Open3D dependency)
+# 5. PLY EXPORT
 # ============================================================================
 def save_ply(filepath, points, colors):
-    """Save point cloud as PLY file."""
+    """Save point cloud as binary PLY."""
     n = len(points)
     if n == 0:
         log.warning("No points to save")
         return
 
-    filepath = str(filepath)
     header = (
         "ply\n"
         "format binary_little_endian 1.0\n"
@@ -440,7 +543,6 @@ def save_ply(filepath, points, colors):
         "end_header\n"
     )
 
-    # Build binary data
     dtype = np.dtype([
         ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
         ('r', 'u1'), ('g', 'u1'), ('b', 'u1'),
@@ -453,7 +555,7 @@ def save_ply(filepath, points, colors):
     data['g'] = colors[:, 1]
     data['b'] = colors[:, 2]
 
-    with open(filepath, 'wb') as f:
+    with open(str(filepath), 'wb') as f:
         f.write(header.encode('ascii'))
         f.write(data.tobytes())
 
@@ -464,7 +566,7 @@ def save_ply(filepath, points, colors):
 # 6. 3D VISUALIZER (PyVista)
 # ============================================================================
 class Visualizer3D:
-    """Non-blocking 3D point cloud viewer using PyVista."""
+    """Non-blocking 3D point cloud viewer."""
 
     def __init__(self):
         self.plotter = None
@@ -472,11 +574,9 @@ class Visualizer3D:
         self._initialized = False
 
     def init(self):
-        """Initialize the PyVista plotter (must be called from main thread)."""
         try:
             import pyvista as pv
             pv.global_theme.background = 'black'
-
             self.plotter = pv.Plotter(title="3D World Map", window_size=(960, 720))
             self.plotter.show(interactive_update=True, auto_close=False)
             self._initialized = True
@@ -486,26 +586,19 @@ class Visualizer3D:
             self._initialized = False
 
     def update(self, points, colors):
-        """Update displayed point cloud."""
         if not self._initialized or len(points) < 10:
             return
-
         try:
             import pyvista as pv
-
             cloud = pv.PolyData(points.astype(np.float32))
-            # Colors need to be 0-255 uint8, shape (N, 3)
             cloud.point_data['RGB'] = colors
-
             if self.actor is not None:
                 self.plotter.remove_actor(self.actor)
-
             self.actor = self.plotter.add_points(
                 cloud, scalars='RGB', rgb=True,
                 point_size=2, render_points_as_spheres=False,
             )
             self.plotter.update()
-
         except Exception as e:
             log.debug(f"Viz update error: {e}")
 
@@ -521,7 +614,7 @@ class Visualizer3D:
 # 7. MAIN APPLICATION
 # ============================================================================
 class WorldMapper:
-    """Main application orchestrating all modules."""
+    """Main loop with keyframe-based accumulation."""
 
     def __init__(self, video_path=None, headless=False):
         self.running = True
@@ -537,43 +630,57 @@ class WorldMapper:
         self.last_save = time.time()
         self.last_backup = time.time()
         self.last_status = time.time()
-        self.last_depth_save = 0
         self.frame_idx = 0
         self.fps_history = []
 
-        # Signal handler
+        # Keyframe state
+        self.last_kf_pose = np.eye(4, dtype=np.float64)
+        self.frames_since_kf = 0
+        self.keyframe_count = 0
+
         signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, sig, frame):
         log.info("SIGINT received, shutting down gracefully...")
         self.running = False
 
+    def _is_keyframe(self, pose):
+        """Decide if this frame should contribute points to the cloud."""
+        self.frames_since_kf += 1
+
+        t_diff = np.linalg.norm(pose[:3, 3] - self.last_kf_pose[:3, 3])
+        R_diff = pose[:3, :3] @ self.last_kf_pose[:3, :3].T
+        angle = np.arccos(np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0))
+
+        # Keyframe if moved enough, rotated enough, or been too long
+        if t_diff > 0.08 or angle > np.radians(5) or self.frames_since_kf > 15:
+            self.last_kf_pose = pose.copy()
+            self.frames_since_kf = 0
+            self.keyframe_count += 1
+            return True
+        return False
+
     def _save_state(self, tag=""):
-        """Save current point cloud."""
         pts, cols = self.cloud.get_data()
         if len(pts) == 0:
             return
-
-        # Latest
         save_ply(SPLAT_DIR / "cloud_latest.ply", pts, cols)
-
         if tag:
             save_ply(SPLAT_DIR / f"cloud_{tag}.ply", pts, cols)
 
     def run(self):
         log.info("=" * 60)
-        log.info("3D World Mapper starting")
+        log.info("Eridian v2 — 3D World Mapper")
         log.info("=" * 60)
 
         # ── Init camera ────────────────────────────────────────────
         log.info("Initializing camera...")
-        loop = not self.headless  # headless processes video once, GUI loops
+        loop = not self.headless
         self.camera = CameraCapture(video_path=self.video_path, loop=loop)
         if self.camera.cap is None:
             log.error("No camera available. Exiting.")
             return
 
-        # Read one frame to get actual resolution
         ok, test_frame = self.camera.read()
         if not ok:
             log.error("Cannot read from camera. Exiting.")
@@ -582,15 +689,13 @@ class WorldMapper:
         h, w = test_frame.shape[:2]
         log.info(f"Camera resolution: {w}x{h}")
 
-        # ── Estimate camera intrinsics ─────────────────────────────
-        fx = fy = w * 0.8  # Rough approximation
+        # ── Camera intrinsics ──────────────────────────────────────
+        fx = fy = w * 0.8
         cx, cy = w / 2.0, h / 2.0
-        K = np.array([[fx, 0, cx],
-                      [0, fy, cy],
-                      [0,  0,  1]], dtype=np.float64)
+        K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
         log.info(f"Camera intrinsics: fx={fx:.0f} fy={fy:.0f} cx={cx:.0f} cy={cy:.0f}")
 
-        # ── Init depth estimator ───────────────────────────────────
+        # ── Init modules ───────────────────────────────────────────
         log.info("Loading depth estimation model...")
         try:
             self.depth_estimator = DepthEstimator()
@@ -598,15 +703,10 @@ class WorldMapper:
             log.error(f"Failed to load depth model: {e}")
             return
 
-        # ── Init pose estimator ────────────────────────────────────
         self.pose_estimator = PoseEstimator(fx, fy, cx, cy)
 
-        # ── Init 3D visualizer ─────────────────────────────────────
         if not self.headless:
             self.viz3d.init()
-
-        # ── Create OpenCV windows ──────────────────────────────────
-        if not self.headless:
             cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Features", cv2.WINDOW_NORMAL)
@@ -627,7 +727,6 @@ class WorldMapper:
             while self.running:
                 t_start = time.time()
 
-                # Read frame
                 ok, frame = self.camera.read()
                 if not ok:
                     if self.headless and self.camera.is_video:
@@ -640,14 +739,14 @@ class WorldMapper:
 
                 self.frame_idx += 1
 
-                # ── Depth estimation ───────────────────────────────
+                # ── Depth ──────────────────────────────────────────
                 depth = None
                 try:
                     depth = self.depth_estimator.estimate(frame)
                 except Exception as e:
                     log.warning(f"Depth estimation failed: {e}")
 
-                # ── Pose estimation ────────────────────────────────
+                # ── Pose ───────────────────────────────────────────
                 pose = None
                 matches_img = frame.copy()
                 try:
@@ -655,14 +754,15 @@ class WorldMapper:
                 except Exception as e:
                     log.warning(f"Pose estimation failed: {e}")
 
-                # ── Point cloud accumulation ───────────────────────
+                # ── Keyframe-gated point accumulation ──────────────
                 if depth is not None and pose is not None:
-                    try:
-                        self.cloud.add_frame(depth, frame, pose, K)
-                    except Exception as e:
-                        log.warning(f"Point cloud accumulation failed: {e}")
+                    if self._is_keyframe(pose):
+                        try:
+                            self.cloud.add_frame(depth, frame, pose, K)
+                        except Exception as e:
+                            log.warning(f"Point cloud accumulation failed: {e}")
 
-                # ── FPS tracking ───────────────────────────────────
+                # ── FPS ────────────────────────────────────────────
                 dt = time.time() - t_start
                 fps = 1.0 / dt if dt > 0 else 0
                 self.fps_history.append(fps)
@@ -670,21 +770,20 @@ class WorldMapper:
                     self.fps_history = self.fps_history[-30:]
                 avg_fps = sum(self.fps_history) / len(self.fps_history)
 
-                # ── Display (skip in headless mode) ────────────────
+                # ── Display ────────────────────────────────────────
                 if not self.headless:
-                    disp_frame = frame.copy()
-                    cv2.putText(disp_frame, f"FPS: {avg_fps:.1f}",
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                                (0, 255, 0), 2)
-                    cv2.putText(disp_frame, f"Points: {self.cloud.count():,}",
-                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                                (0, 255, 0), 2)
-                    cv2.imshow("Camera", disp_frame)
+                    disp = frame.copy()
+                    cv2.putText(disp, f"FPS: {avg_fps:.1f}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.putText(disp, f"Points: {self.cloud.count():,}", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    cv2.putText(disp, f"KF: {self.keyframe_count}", (10, 90),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                    cv2.imshow("Camera", disp)
 
                     if depth is not None:
-                        depth_norm = ((depth - depth.min()) / (depth.max() - depth.min() + 1e-6) * 255).astype(np.uint8)
-                        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
-                        cv2.imshow("Depth", depth_color)
+                        d_norm = ((depth - depth.min()) / (depth.max() - depth.min() + 1e-6) * 255).astype(np.uint8)
+                        cv2.imshow("Depth", cv2.applyColorMap(d_norm, cv2.COLORMAP_INFERNO))
 
                     cv2.imshow("Features", matches_img)
 
@@ -695,37 +794,34 @@ class WorldMapper:
                 # ── Save depth frames ──────────────────────────────
                 if depth is not None and self.frame_idx % 5 == 0:
                     try:
-                        depth_16 = (depth * 1000).astype(np.uint16)  # mm
-                        fname = DEPTH_DIR / f"depth_{self.frame_idx:06d}.png"
-                        cv2.imwrite(str(fname), depth_16)
-                    except Exception as e:
-                        log.debug(f"Depth save failed: {e}")
+                        depth_16 = (depth * 1000).astype(np.uint16)
+                        cv2.imwrite(str(DEPTH_DIR / f"depth_{self.frame_idx:06d}.png"), depth_16)
+                    except Exception:
+                        pass
 
                 # ── Periodic saves ─────────────────────────────────
                 now = time.time()
                 if now - self.last_save >= 10:
                     self._save_state()
                     self.last_save = now
-
                 if now - self.last_backup >= 60:
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     self._save_state(ts)
                     self.last_backup = now
 
-                # ── Status line ────────────────────────────────────
+                # ── Status ─────────────────────────────────────────
                 if now - self.last_status >= 5:
                     tracking = "OK" if self.pose_estimator.tracking else "LOST"
-                    last_save_ago = now - self.last_save
                     log.info(
                         f"STATUS | FPS: {avg_fps:.1f} | Points: {self.cloud.count():,} | "
-                        f"Tracking: {tracking} | Last save: {last_save_ago:.0f}s ago"
+                        f"Tracking: {tracking} | Keyframes: {self.keyframe_count} | "
+                        f"Last save: {now - self.last_save:.0f}s ago"
                     )
                     self.last_status = now
 
-                # ── Check for quit ─────────────────────────────────
+                # ── Quit ───────────────────────────────────────────
                 if not self.headless:
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
                         log.info("'q' pressed, shutting down...")
                         self.running = False
 
@@ -736,18 +832,14 @@ class WorldMapper:
 
     def _shutdown(self):
         log.info("Shutting down...")
-
-        # Final save
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self._save_state(f"final_{ts}")
-
-        # Cleanup
         if self.camera:
             self.camera.release()
         cv2.destroyAllWindows()
         self.viz3d.close()
-
         log.info(f"Final point count: {self.cloud.count():,}")
+        log.info(f"Total keyframes: {self.keyframe_count}")
         log.info("Shutdown complete")
 
 
@@ -768,7 +860,7 @@ if __name__ == "__main__":
     headless = args.headless
     if args.test:
         video = str(TEST_VIDEO)
-        headless = True  # test mode implies headless
+        headless = True
 
     mapper = WorldMapper(video_path=video, headless=headless)
     mapper.run()
