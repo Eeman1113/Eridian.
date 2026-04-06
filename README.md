@@ -4,6 +4,7 @@
 
 Eridian turns any webcam into a spatial scanner. It watches what you see, understands how far away everything is, tracks how you move, and builds a 3D colored map of your surroundings — all in real time, on a laptop, with no special hardware.
 
+[![PyPI](https://img.shields.io/pypi/v/eridian)](https://pypi.org/project/eridian/)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
