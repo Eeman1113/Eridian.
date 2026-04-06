@@ -6,6 +6,7 @@ Uses webcam + monocular depth estimation + visual odometry to build
 a colored 3D point cloud of the environment in real time.
 """
 
+import argparse
 import os
 import sys
 import time
@@ -23,6 +24,7 @@ import torch
 BASE_DIR = Path(__file__).parent
 SPLAT_DIR = BASE_DIR / "splat"
 DEPTH_DIR = SPLAT_DIR / "depth_frames"
+TEST_VIDEO = BASE_DIR / "data" / "video.mp4"
 LOG_DIR = BASE_DIR / "logs"
 
 for d in [SPLAT_DIR, DEPTH_DIR, LOG_DIR]:
@@ -44,45 +46,95 @@ log = logging.getLogger("mapper")
 # 1. CAMERA CAPTURE
 # ============================================================================
 class CameraCapture:
-    """OpenCV camera with auto-fallback and reconnection."""
+    """OpenCV camera with auto-fallback to video file."""
 
-    def __init__(self, width=640, height=480, fps=30):
+    def __init__(self, width=640, height=480, fps=30, video_path=None, loop=True):
         self.width = width
         self.height = height
         self.fps = fps
         self.cap = None
+        self.is_video = False
+        self.video_path = video_path
+        self._loop = loop
         self._open()
 
     def _open(self):
+        # If video path given, use it directly
+        if self.video_path:
+            return self._open_video(self.video_path)
+
+        # Try cameras first
         for idx in (0, 1, 2):
             log.info(f"Trying camera index {idx}...")
             cap = cv2.VideoCapture(idx)
             if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                cap.set(cv2.CAP_PROP_FPS, self.fps)
-                self.cap = cap
-                log.info(f"Camera opened on index {idx}")
-                return
+                # Try reading a frame to confirm it actually works
+                ok, _ = cap.read()
+                if ok:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+                    cap.set(cv2.CAP_PROP_FPS, self.fps)
+                    self.cap = cap
+                    self.is_video = False
+                    log.info(f"Camera opened on index {idx}")
+                    return
             cap.release()
-        log.error("No camera found on indices 0-2")
-        self.cap = None
+
+        # No camera — fall back to test video
+        log.warning("No camera found, looking for test video...")
+        if TEST_VIDEO.exists():
+            self._open_video(str(TEST_VIDEO))
+        else:
+            log.error("No camera and no test video at ./data/video.mp4")
+            self.cap = None
+
+    def _open_video(self, path):
+        cap = cv2.VideoCapture(str(path))
+        if cap.isOpened():
+            self.cap = cap
+            self.is_video = True
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            vfps = cap.get(cv2.CAP_PROP_FPS)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            log.info(f"TEST MODE: Using video {path} ({w}x{h}, {total} frames, {vfps:.0f}fps)")
+        else:
+            log.error(f"Cannot open video: {path}")
+            self.cap = None
 
     def read(self):
-        """Returns (ok, frame). If camera lost, attempts reconnect."""
+        """Returns (ok, frame). Loops video in test mode."""
         if self.cap is None or not self.cap.isOpened():
-            log.warning("Camera disconnected, attempting reconnect...")
-            self._open()
+            if not self.is_video:
+                log.warning("Camera disconnected, attempting reconnect...")
+                self._open()
             if self.cap is None:
                 return False, None
+
         ok, frame = self.cap.read()
-        if not ok:
+
+        if not ok and self.is_video:
+            if self._loop:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self.cap.read()
+                log.info("Test video looped")
+            else:
+                return False, None
+
+        if not ok and not self.is_video:
             log.warning("Frame read failed, reconnecting...")
             self.cap.release()
             self.cap = None
             self._open()
             if self.cap is not None:
                 ok, frame = self.cap.read()
+
+        # Resize to target resolution for consistency
+        if ok and frame is not None:
+            h, w = frame.shape[:2]
+            if w != self.width or h != self.height:
+                frame = cv2.resize(frame, (self.width, self.height))
+
         return ok, frame
 
     def release(self):
@@ -94,33 +146,38 @@ class CameraCapture:
 # 2. MONOCULAR DEPTH ESTIMATION
 # ============================================================================
 class DepthEstimator:
-    """Depth Anything V2 (small) via transformers, with MiDaS fallback."""
+    """Depth Anything V2 metric (small) via transformers, with fallbacks."""
 
     def __init__(self):
         self.pipe = None
         self.model_name = None
+        self.is_metric = False
         self._load_model()
 
     def _load_model(self):
         from transformers import pipeline
 
-        # Try Depth Anything V2 small first
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
+
+        # Metric models first (output real meters), then relative fallbacks
         candidates = [
-            "depth-anything/Depth-Anything-V2-Small-hf",
-            "depth-anything/Depth-Anything-V2-Base-hf",
-            "Intel/dpt-swinv2-tiny-256",     # DPT small
-            "Intel/dpt-hybrid-midas",
+            ("depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf", True),
+            ("depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf", True),
+            ("depth-anything/Depth-Anything-V2-Small-hf", False),
+            ("Intel/dpt-swinv2-tiny-256", False),
+            ("Intel/dpt-hybrid-midas", False),
         ]
-        for name in candidates:
+        for name, metric in candidates:
             try:
                 log.info(f"Loading depth model: {name}")
                 self.pipe = pipeline(
                     "depth-estimation",
                     model=name,
-                    device="mps" if torch.backends.mps.is_available() else "cpu",
+                    device=device,
                 )
                 self.model_name = name
-                log.info(f"Depth model loaded: {name}")
+                self.is_metric = metric
+                log.info(f"Depth model loaded: {name} ({'METRIC' if metric else 'relative'})")
                 return
             except Exception as e:
                 log.warning(f"Failed to load {name}: {e}")
@@ -128,30 +185,37 @@ class DepthEstimator:
         raise RuntimeError("Could not load any depth estimation model")
 
     def estimate(self, frame_bgr):
-        """Returns depth map as float32 HxW array (approximate meters)."""
+        """Returns depth map as float32 HxW array in meters."""
         from PIL import Image as PILImage
 
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         pil_img = PILImage.fromarray(rgb)
 
         result = self.pipe(pil_img)
-        depth_raw = result["depth"]
-        # Handle both PIL Image and numpy array returns
-        if isinstance(depth_raw, PILImage.Image):
-            depth = np.array(depth_raw, dtype=np.float32)
+
+        # Metric models: use predicted_depth tensor (actual meters)
+        # Relative models: use depth PIL image and normalize to fake meters
+        if self.is_metric and "predicted_depth" in result:
+            depth = result["predicted_depth"]
+            if hasattr(depth, 'cpu'):
+                depth = depth.cpu().numpy()
+            depth = np.array(depth, dtype=np.float32)
         else:
-            depth = np.array(depth_raw, dtype=np.float32)
+            depth_raw = result["depth"]
+            if isinstance(depth_raw, PILImage.Image):
+                depth = np.array(depth_raw, dtype=np.float32)
+            else:
+                depth = np.array(depth_raw, dtype=np.float32)
+            # Normalize relative depth to approximate meters
+            d_min, d_max = depth.min(), depth.max()
+            if d_max - d_min > 1e-6:
+                depth = (depth - d_min) / (d_max - d_min)
+            depth = 0.5 + depth * 9.5  # [0.5, 10.0] meters
 
         # Resize to match input frame
         h, w = frame_bgr.shape[:2]
         if depth.shape != (h, w):
             depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_LINEAR)
-
-        # Normalize: map to approximate meters (0.5 - 10m range)
-        d_min, d_max = depth.min(), depth.max()
-        if d_max - d_min > 1e-6:
-            depth = (depth - d_min) / (d_max - d_min)
-        depth = 0.5 + depth * 9.5  # [0.5, 10.0] meters
 
         return depth
 
@@ -174,8 +238,9 @@ class PoseEstimator:
         self.pose = np.eye(4, dtype=np.float64)  # world pose (camera-to-world)
         self.tracking = True
 
-    def update(self, frame_bgr):
-        """Update pose from new frame. Returns (pose_4x4, keypoints, matches_img)."""
+    def update(self, frame_bgr, depth=None):
+        """Update pose from new frame. Returns (pose_4x4, keypoints, matches_img).
+        If depth is provided (metric), uses it to scale the translation vector."""
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         kp, des = self.orb.detectAndCompute(gray, None)
 
@@ -225,10 +290,18 @@ class PoseEstimator:
 
         _, R, t, mask2 = cv2.recoverPose(E, pts1, pts2, self.K)
 
+        # Scale translation using depth if available
+        # recoverPose returns unit translation — scale it by median depth
+        # so camera motion is proportional to scene depth
+        t_scaled = t.ravel()
+        if depth is not None:
+            median_depth = float(np.median(depth[depth > 0.1]))
+            t_scaled = t_scaled * median_depth * 0.01  # conservative scale factor
+
         # Build relative transform
         T_rel = np.eye(4, dtype=np.float64)
         T_rel[:3, :3] = R
-        T_rel[:3, 3] = t.ravel()
+        T_rel[:3, 3] = t_scaled
 
         # Accumulate pose
         self.pose = self.pose @ np.linalg.inv(T_rel)
@@ -450,13 +523,15 @@ class Visualizer3D:
 class WorldMapper:
     """Main application orchestrating all modules."""
 
-    def __init__(self):
+    def __init__(self, video_path=None, headless=False):
         self.running = True
         self.camera = None
         self.depth_estimator = None
         self.pose_estimator = None
         self.cloud = PointCloud()
         self.viz3d = Visualizer3D()
+        self.video_path = video_path
+        self.headless = headless
 
         # Timing
         self.last_save = time.time()
@@ -492,7 +567,8 @@ class WorldMapper:
 
         # ── Init camera ────────────────────────────────────────────
         log.info("Initializing camera...")
-        self.camera = CameraCapture()
+        loop = not self.headless  # headless processes video once, GUI loops
+        self.camera = CameraCapture(video_path=self.video_path, loop=loop)
         if self.camera.cap is None:
             log.error("No camera available. Exiting.")
             return
@@ -526,22 +602,25 @@ class WorldMapper:
         self.pose_estimator = PoseEstimator(fx, fy, cx, cy)
 
         # ── Init 3D visualizer ─────────────────────────────────────
-        self.viz3d.init()
+        if not self.headless:
+            self.viz3d.init()
 
         # ── Create OpenCV windows ──────────────────────────────────
-        cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
-        cv2.namedWindow("Features", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Camera", 480, 360)
-        cv2.resizeWindow("Depth", 480, 360)
-        cv2.resizeWindow("Features", 480, 360)
-        # Arrange side by side
-        cv2.moveWindow("Camera", 0, 0)
-        cv2.moveWindow("Depth", 490, 0)
-        cv2.moveWindow("Features", 980, 0)
+        if not self.headless:
+            cv2.namedWindow("Camera", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Depth", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Features", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Camera", 480, 360)
+            cv2.resizeWindow("Depth", 480, 360)
+            cv2.resizeWindow("Features", 480, 360)
+            cv2.moveWindow("Camera", 0, 0)
+            cv2.moveWindow("Depth", 490, 0)
+            cv2.moveWindow("Features", 980, 0)
 
-        log.info("Starting main loop")
-        log.info("Press 'q' in any OpenCV window or Ctrl+C to quit")
+        mode = "HEADLESS" if self.headless else "GUI"
+        log.info(f"Starting main loop ({mode})")
+        if not self.headless:
+            log.info("Press 'q' in any OpenCV window or Ctrl+C to quit")
 
         # ── Main loop ──────────────────────────────────────────────
         try:
@@ -551,6 +630,9 @@ class WorldMapper:
                 # Read frame
                 ok, frame = self.camera.read()
                 if not ok:
+                    if self.headless and self.camera.is_video:
+                        log.info("Video finished, saving final output...")
+                        break
                     log.warning("No frame, waiting for camera...")
                     self._save_state("disconnect")
                     time.sleep(1.0)
@@ -569,7 +651,7 @@ class WorldMapper:
                 pose = None
                 matches_img = frame.copy()
                 try:
-                    pose, kp, matches_img = self.pose_estimator.update(frame)
+                    pose, kp, matches_img = self.pose_estimator.update(frame, depth=depth)
                 except Exception as e:
                     log.warning(f"Pose estimation failed: {e}")
 
@@ -580,7 +662,7 @@ class WorldMapper:
                     except Exception as e:
                         log.warning(f"Point cloud accumulation failed: {e}")
 
-                # ── Display ────────────────────────────────────────
+                # ── FPS tracking ───────────────────────────────────
                 dt = time.time() - t_start
                 fps = 1.0 / dt if dt > 0 else 0
                 self.fps_history.append(fps)
@@ -588,29 +670,27 @@ class WorldMapper:
                     self.fps_history = self.fps_history[-30:]
                 avg_fps = sum(self.fps_history) / len(self.fps_history)
 
-                # Camera feed with FPS
-                disp_frame = frame.copy()
-                cv2.putText(disp_frame, f"FPS: {avg_fps:.1f}",
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                            (0, 255, 0), 2)
-                cv2.putText(disp_frame, f"Points: {self.cloud.count():,}",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 255, 0), 2)
-                cv2.imshow("Camera", disp_frame)
+                # ── Display (skip in headless mode) ────────────────
+                if not self.headless:
+                    disp_frame = frame.copy()
+                    cv2.putText(disp_frame, f"FPS: {avg_fps:.1f}",
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                (0, 255, 0), 2)
+                    cv2.putText(disp_frame, f"Points: {self.cloud.count():,}",
+                                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                (0, 255, 0), 2)
+                    cv2.imshow("Camera", disp_frame)
 
-                # Depth map
-                if depth is not None:
-                    depth_norm = ((depth - depth.min()) / (depth.max() - depth.min() + 1e-6) * 255).astype(np.uint8)
-                    depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
-                    cv2.imshow("Depth", depth_color)
+                    if depth is not None:
+                        depth_norm = ((depth - depth.min()) / (depth.max() - depth.min() + 1e-6) * 255).astype(np.uint8)
+                        depth_color = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+                        cv2.imshow("Depth", depth_color)
 
-                # Features
-                cv2.imshow("Features", matches_img)
+                    cv2.imshow("Features", matches_img)
 
-                # ── 3D Visualization ───────────────────────────────
-                if self.frame_idx % 5 == 0:  # Update 3D view every 5 frames
-                    pts, cols = self.cloud.get_data()
-                    self.viz3d.update(pts, cols)
+                    if self.frame_idx % 5 == 0:
+                        pts, cols = self.cloud.get_data()
+                        self.viz3d.update(pts, cols)
 
                 # ── Save depth frames ──────────────────────────────
                 if depth is not None and self.frame_idx % 5 == 0:
@@ -643,10 +723,11 @@ class WorldMapper:
                     self.last_status = now
 
                 # ── Check for quit ─────────────────────────────────
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    log.info("'q' pressed, shutting down...")
-                    self.running = False
+                if not self.headless:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        log.info("'q' pressed, shutting down...")
+                        self.running = False
 
         except Exception as e:
             log.error(f"Main loop error: {e}", exc_info=True)
@@ -674,5 +755,20 @@ class WorldMapper:
 # ENTRY POINT
 # ============================================================================
 if __name__ == "__main__":
-    mapper = WorldMapper()
+    parser = argparse.ArgumentParser(description="Eridian — 3D World Mapper")
+    parser.add_argument("--test", action="store_true",
+                        help="Use test video (./data/video.mp4) instead of camera")
+    parser.add_argument("--video", type=str, default=None,
+                        help="Path to a video file to use as input")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without GUI windows (process and save only)")
+    args = parser.parse_args()
+
+    video = args.video
+    headless = args.headless
+    if args.test:
+        video = str(TEST_VIDEO)
+        headless = True  # test mode implies headless
+
+    mapper = WorldMapper(video_path=video, headless=headless)
     mapper.run()
