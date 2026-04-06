@@ -8,9 +8,7 @@ Real-time monocular 3D world mapping from a single webcam. Eridian combines deep
 
 ## Demo
 
-https://github.com/user-attachments/assets/eridian_demo.mp4
-
-<video src="output_video/eridian_demo.mp4" controls width="100%"></video>
+https://github.com/Eeman1113/Eridian./raw/main/output_video/eridian_demo.mp4
 
 > 4-panel view: Camera feed | Depth map | ORB features | 3D point cloud
 
