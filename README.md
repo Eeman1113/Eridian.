@@ -53,35 +53,54 @@ The accumulated point cloud is rendered in real time alongside the camera feed, 
 
 ---
 
-## The bigger picture: spatial understanding for the visually impaired
+## Why "Eridian"?
 
-Eridian is a building block toward something much more important.
+This project is named after Rocky, the Eridian engineer from Andy Weir's *Project Hail Mary*.
 
-**700 million people worldwide live with significant vision impairment.** For them, understanding the 3D layout of an unfamiliar room — where the furniture is, how far the doorway is, whether there's a step down ahead — requires either memorization, a cane, or another person.
+Rocky is blind. His entire species is. They have no concept of vision. They understand the world through sound and touch. When Rocky needs to communicate spatial concepts with a human, he builds a device: a flat surface covered with a grid of metal pins driven by tiny motors. Each pin rises and falls independently. Run your hand across it and you feel the shape of a star map, a molecule, a room. It is a screen for someone who cannot see.
 
-A phone camera combined with real-time 3D reconstruction changes that equation fundamentally:
+I read that and couldn't stop thinking about it.
 
-**Spatial awareness from a phone.** Eridian's depth estimation and 3D mapping pipeline runs on a single camera — the same one in every smartphone. This means a blind person's phone could continuously build a 3D model of their surroundings as they move through a space.
+**700 million people on Earth live with significant vision impairment.** They navigate the world with canes, memorized routes, and other people's descriptions. Understanding the 3D layout of an unfamiliar room, where the furniture is, how far the doorway is, whether there's a step ahead, requires either experience or help.
 
-**What this enables (with further development):**
+Rocky's pin device is fiction. But the idea isn't.
 
-- **Obstacle detection and distance warnings** — "There's a table 1.5 meters ahead, slightly to your left." The metric depth map already provides this information at every pixel, every frame.
+## The endgame: a real-world Rocky device
 
-- **Room layout narration** — By accumulating the 3D map over time, the system can describe the overall structure of a space: "You're in a rectangular room, about 4 by 6 meters. The door is behind you to the right. There's a couch along the left wall."
+The long-term goal of this project is to build a physical tactile display, a surface of servo-driven pins that conforms in real time to whatever a phone camera is looking at.
 
-- **Path planning** — The 3D point cloud can be analyzed to find clear walking paths and identify floor-level obstacles that a cane might miss — like a low table or an open cabinet door at head height.
+Point your phone at a room. The pin surface reshapes itself into a miniature relief of that room. Feel the couch on the left, the table ahead, the doorway to the right. Move the phone and the surface updates. It's a live tactile map of the world around you.
 
-- **Spatial memory** — Unlike a cane that only senses the immediate moment, a persistent 3D map remembers the entire space. If you've already scanned a room, the system knows what's there even when the camera isn't pointing at it.
+**How it works (the vision):**
 
-- **Indoor navigation** — Combined with visual place recognition, the accumulated 3D maps could enable turn-by-turn navigation inside buildings where GPS doesn't work.
+1. **Eridian runs on the phone** and reconstructs the 3D scene from the camera feed, exactly as it does now
+2. **The 3D point cloud gets downsampled** to match the resolution of the physical pin grid (say, 32x32 or 64x64 pins)
+3. **Each pin's height maps to the depth** at that grid position, driven by a small servo or linear actuator
+4. **The surface updates in real time** as the phone scans the environment, reshaping itself to match whatever the camera sees
 
-**Why single-camera monocular reconstruction matters for this mission:**
+This is not a screen. It's not audio. It's direct spatial understanding through touch, the same way Rocky's species understands the universe.
 
-Existing spatial sensing tools for the visually impaired (like LiDAR-equipped devices) are expensive and limited to specific hardware. Eridian's approach works with any camera — including the $50 phone in someone's pocket. By solving the hard problems of monocular depth estimation and visual odometry in software, the hardware barrier drops to zero.
+## Where Eridian fits today
 
-The current system is a proof of concept. The depth estimation is accurate enough to detect obstacles. The pose tracking is robust enough to build coherent maps. The filtering pipeline produces clean enough geometry to reason about room structure. What remains is building the accessibility layer on top: the natural language descriptions, the haptic feedback, the audio cues that translate a 3D point cloud into spatial understanding for someone who can't see it.
+Eridian is the perception layer. It solves the first and hardest problem: taking a flat 2D video from a single cheap camera and turning it into accurate 3D geometry, in real time, on consumer hardware.
 
-**Eridian is the perception layer. The next step is making it speak.**
+The software side is the foundation everything else gets built on:
+
+- **Obstacle detection and distance warnings** - "Table 1.5 meters ahead, slightly left." The metric depth map already provides this at every pixel, every frame.
+
+- **Room layout narration** - Accumulate the 3D map over time, then describe the space: "Rectangular room, about 4 by 6 meters. Door behind you to the right. Couch along the left wall."
+
+- **Path planning** - Analyze the point cloud for clear walking paths and floor-level obstacles that a cane might miss, like a low table or an open cabinet door at head height.
+
+- **Spatial memory** - A persistent 3D map remembers the entire space. Scan a room once and the system knows what's there even when the camera isn't pointing at it.
+
+- **Indoor navigation** - Combined with visual place recognition, accumulated 3D maps could enable turn-by-turn navigation inside buildings where GPS doesn't work.
+
+**Why single-camera matters:** Existing spatial sensing (LiDAR devices) is expensive and locked to specific hardware. Eridian runs on any camera, including the phone in someone's pocket. The hardware barrier drops to zero.
+
+**The next steps are:** the servo-driven pin surface prototype, the phone-to-device communication layer, and the haptic feedback design. Eridian is the eyes. The pin grid is the hands. Together they give spatial understanding to someone who has neither.
+
+**Eridian is the perception layer. The pin grid is the interface. Rocky showed us the idea. We're building it for real.**
 
 ---
 
