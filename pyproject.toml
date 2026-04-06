@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eridian"
+version = "0.1.0"
+description = "Real-time 3D world reconstruction from a single camera"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Eeman Majumder" }]
+keywords = ["3d", "depth-estimation", "point-cloud", "monocular", "reconstruction", "slam"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "Programming Language :: Python :: 3",
+]
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "torch",
+    "transformers",
+    "pyvista",
+    "pillow",
+]
+
+[project.scripts]
+eridian = "eridian.main:cli_main"
+
+[project.urls]
+Homepage = "https://github.com/Eeman1113/Eridian."
+Repository = "https://github.com/Eeman1113/Eridian."
+
+[tool.setuptools.packages.find]
+include = ["eridian*"]

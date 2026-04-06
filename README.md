@@ -94,7 +94,18 @@ The current system is a proof of concept. The depth estimation is accurate enoug
 
 ---
 
-## Quick start
+## Install
+
+### Option 1: pip install (recommended)
+
+```bash
+pip install eridian
+eridian                # launch with webcam
+eridian --test         # run on test video
+eridian --video v.mp4  # any video file
+```
+
+### Option 2: clone and run
 
 ```bash
 git clone https://github.com/Eeman1113/Eridian..git
@@ -110,15 +121,25 @@ cd Eridian.
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 python test_components.py   # verify depth model + PLY export
 python main.py              # launch
+```
+
+### Use as a library
+
+```python
+from eridian import DepthEstimator, PointCloud, PoseEstimator
+
+depth_est = DepthEstimator()
+depth_map = depth_est.estimate(frame)
 ```
 
 ### Test mode (no camera needed)
 
 ```bash
-python main.py --test                  # process data/video.mp4 headless
-python main.py --video path/to/vid.mp4 # any video file
+eridian --test                         # process data/video.mp4 headless
+eridian --video path/to/vid.mp4        # any video file
 python render_video.py                 # render 4-panel demo video
 ```
 

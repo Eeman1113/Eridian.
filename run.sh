@@ -37,6 +37,7 @@ source venv/bin/activate
 echo "Installing dependencies..."
 pip install --upgrade pip -q
 pip install -r requirements.txt -q
+pip install -e . -q
 
 # Create output directories
 mkdir -p splat/depth_frames logs
