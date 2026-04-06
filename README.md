@@ -8,6 +8,7 @@ Eridian turns any webcam into a spatial scanner. It watches what you see, unders
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Wiki](https://img.shields.io/badge/docs-Wiki-blue)](https://github.com/Eeman1113/Eridian./wiki)
 
 ---
 

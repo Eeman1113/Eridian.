@@ -32,6 +32,7 @@ eridian = "eridian.main:cli_main"
 [project.urls]
 Homepage = "https://github.com/Eeman1113/Eridian."
 Repository = "https://github.com/Eeman1113/Eridian."
+Documentation = "https://github.com/Eeman1113/Eridian./wiki"
 
 [tool.setuptools.packages.find]
 include = ["eridian*"]
