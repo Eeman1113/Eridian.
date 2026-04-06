@@ -6,3 +6,6 @@ venv/
 .eggs/
 *.pyc
 .DS_Store
+logs/
+splat/
+.claude/

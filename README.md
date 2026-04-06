@@ -120,9 +120,12 @@ The software side is the foundation everything else gets built on:
 
 ```bash
 pip install eridian
-eridian                # launch with webcam
-eridian --test         # run on test video
-eridian --video v.mp4  # any video file
+eridian                    # launch with webcam (interactive camera picker)
+eridian --camera 0         # use specific camera index
+eridian --test             # run on test video
+eridian --video v.mp4      # any video file
+eridian --save             # save PLY to current directory on exit
+eridian --render --video v.mp4   # render 4-panel demo video
 ```
 
 ### Option 2: clone and run
@@ -146,30 +149,137 @@ python test_components.py   # verify depth model + PLY export
 python main.py              # launch
 ```
 
-### Use as a library
-
-```python
-from eridian import DepthEstimator, PointCloud, PoseEstimator
-
-depth_est = DepthEstimator()
-depth_map = depth_est.estimate(frame)
-```
-
 ### Test mode (no camera needed)
 
 ```bash
 eridian --test                         # process data/video.mp4 headless
 eridian --video path/to/vid.mp4        # any video file
-python render_video.py                 # render 4-panel demo video
+eridian --render --video v.mp4         # render 4-panel demo video
 ```
 
 If no camera is detected, Eridian automatically falls back to `data/video.mp4`.
+
+---
+
+## Python API
+
+Eridian exposes a full Python API for integration into your own projects.
+
+### Quick start
+
+```python
+from eridian import Eridian
+
+e = Eridian()
+
+# Estimate depth from a single image
+import cv2
+frame = cv2.imread("photo.jpg")
+depth = e.estimate_depth(frame)   # float32 HxW, values in meters
+
+# Convert a frame directly to 3D points
+points, colors = e.frame_to_points(frame)
+
+# Process an entire video
+points, colors = e.process_video("scan.mp4")
+e.save("output.ply")
+```
+
+### Stream from camera
+
+```python
+from eridian import Eridian
+
+e = Eridian()
+for result in e.stream(camera=0, max_frames=100):
+    print(f"Frame {result.frame_index}: {e.point_count} points, keyframe={result.is_keyframe}")
+
+e.save("my_scan.ply")
+```
+
+`stream()` is a generator that yields `FrameResult` objects:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `frame` | `np.ndarray` | BGR image |
+| `depth` | `np.ndarray` | Float32 depth map (meters) |
+| `pose` | `np.ndarray` | 4x4 camera pose matrix |
+| `points` | `np.ndarray` | Accumulated Nx3 points |
+| `colors` | `np.ndarray` | Accumulated Nx3 RGB colors |
+| `is_keyframe` | `bool` | Whether this frame added geometry |
+| `frame_index` | `int` | Frame number |
+
+### Event callbacks
+
+```python
+e = Eridian()
+e.on("frame", lambda idx, frame, depth, pose: print(f"frame {idx}"))
+e.on("keyframe", lambda idx, pts, cols: print(f"keyframe {idx}: {len(pts)} pts"))
+e.on("depth", lambda idx, depth: print(f"depth range: {depth.min():.1f}-{depth.max():.1f}m"))
+
+e.process_video("scan.mp4")
+```
+
+### Save and load point clouds
+
+```python
+from eridian import Eridian, save_ply, load_ply
+
+e = Eridian()
+e.process_video("scan.mp4")
+e.save("scan.ply")
+
+# Load back
+e.load("scan.ply")
+print(e.point_count)
+
+# Or use standalone functions
+points, colors = load_ply("scan.ply")
+save_ply("copy.ply", points, colors)
+```
+
+### Camera discovery
+
+```python
+from eridian import probe_cameras, pick_camera
+
+cameras = probe_cameras()         # list of {"index": int, "width": ..., "height": ...}
+chosen = pick_camera(cameras)     # interactive terminal picker, returns index
+```
+
+### Low-level components
+
+```python
+from eridian import DepthEstimator, PoseEstimator, PointCloud
+
+depth_est = DepthEstimator()
+depth_map = depth_est.estimate(frame)
+
+pose_est = PoseEstimator(fx, fy, cx, cy)
+pose, keypoints, matches = pose_est.update(frame, depth=depth_map)
+
+cloud = PointCloud()
+cloud.add_frame(depth_map, frame, pose, K)
+points, colors = cloud.get_data()
+```
 
 ## Requirements
 
 - Python 3.10 – 3.13
 - A webcam (built-in, USB, or macOS Continuity Camera) — or a video file for test mode
 - CPU-only — no CUDA needed (uses Apple MPS when available)
+
+## CLI Reference
+
+| Flag | Description |
+|------|-------------|
+| `--test` | Use `data/video.mp4` instead of camera |
+| `--video PATH` | Process any video file |
+| `--camera N` | Use camera index N (skip interactive picker) |
+| `--headless` | No GUI windows, process and save only |
+| `--save` | Save PLY to current working directory on exit |
+| `--render` | Render a 4-panel demo video from input |
+| `--output PATH` | Output path for rendered video |
 
 ## Controls
 

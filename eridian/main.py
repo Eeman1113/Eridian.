@@ -7,6 +7,7 @@ a colored 3D point cloud of the environment in real time.
 """
 
 import argparse
+import dataclasses
 import sys
 import time
 import signal
@@ -55,18 +56,64 @@ def _init_runtime():
 
 
 # ============================================================================
-# 1. CAMERA CAPTURE
+# 1. CAMERA DISCOVERY + CAPTURE
 # ============================================================================
+def probe_cameras(max_index=9):
+    """Scan for available cameras. Returns list of dicts with index and resolution."""
+    cameras = []
+    for idx in range(max_index + 1):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cameras.append({"index": idx, "width": w, "height": h})
+            cap.release()
+        else:
+            cap.release()
+    return cameras
+
+
+def pick_camera(cameras):
+    """Interactive camera picker. Returns selected camera index or None."""
+    if not cameras:
+        print("No cameras found.")
+        return None
+
+    if len(cameras) == 1:
+        c = cameras[0]
+        print(f"Found 1 camera: index {c['index']} ({c['width']}x{c['height']})")
+        return c["index"]
+
+    print(f"\nFound {len(cameras)} cameras:\n")
+    for i, c in enumerate(cameras):
+        print(f"  [{i}] Camera {c['index']} ({c['width']}x{c['height']})")
+    print()
+
+    try:
+        choice = input("Select camera number: ").strip()
+        idx = int(choice)
+        if 0 <= idx < len(cameras):
+            return cameras[idx]["index"]
+        print(f"Invalid selection: {idx}")
+        return cameras[0]["index"]
+    except (ValueError, KeyboardInterrupt, EOFError):
+        return None
+
+
 class CameraCapture:
     """OpenCV camera with auto-fallback to video file."""
 
-    def __init__(self, width=640, height=480, fps=30, video_path=None, loop=True):
+    def __init__(self, width=640, height=480, fps=30, video_path=None, loop=True,
+                 camera_index=None):
         self.width = width
         self.height = height
         self.fps = fps
         self.cap = None
         self.is_video = False
         self.video_path = video_path
+        self.camera_index = camera_index
         self._loop = loop
         self._open()
 
@@ -74,7 +121,8 @@ class CameraCapture:
         if self.video_path:
             return self._open_video(self.video_path)
 
-        for idx in (0, 1, 2):
+        indices = [self.camera_index] if self.camera_index is not None else [0, 1, 2]
+        for idx in indices:
             log.info(f"Trying camera index {idx}...")
             cap = cv2.VideoCapture(idx)
             if cap.isOpened():
@@ -575,6 +623,31 @@ def save_ply(filepath, points, colors):
     log.info(f"Saved {n} points to {filepath}")
 
 
+def load_ply(filepath):
+    """Load a binary PLY file. Returns (points_Nx3 float32, colors_Nx3 uint8)."""
+    with open(str(filepath), 'rb') as f:
+        header = b""
+        n_vertices = 0
+        while True:
+            line = f.readline()
+            header += line
+            text = line.decode('ascii', errors='ignore').strip()
+            if text.startswith("element vertex"):
+                n_vertices = int(text.split()[-1])
+            if text == "end_header":
+                break
+
+        dtype = np.dtype([
+            ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+            ('r', 'u1'), ('g', 'u1'), ('b', 'u1'),
+        ])
+        data = np.frombuffer(f.read(n_vertices * dtype.itemsize), dtype=dtype)
+
+    points = np.stack([data['x'], data['y'], data['z']], axis=1)
+    colors = np.stack([data['r'], data['g'], data['b']], axis=1)
+    return points, colors
+
+
 # ============================================================================
 # 6. 3D VISUALIZER (PyVista)
 # ============================================================================
@@ -629,7 +702,7 @@ class Visualizer3D:
 class WorldMapper:
     """Main loop with keyframe-based accumulation."""
 
-    def __init__(self, video_path=None, headless=False):
+    def __init__(self, video_path=None, headless=False, camera_index=None, save=False):
         self.running = True
         self.camera = None
         self.depth_estimator = None
@@ -638,6 +711,8 @@ class WorldMapper:
         self.viz3d = Visualizer3D()
         self.video_path = video_path
         self.headless = headless
+        self.camera_index = camera_index
+        self.save_to_cwd = save
 
         # Timing
         self.last_save = time.time()
@@ -680,6 +755,8 @@ class WorldMapper:
         save_ply(SPLAT_DIR / "cloud_latest.ply", pts, cols)
         if tag:
             save_ply(SPLAT_DIR / f"cloud_{tag}.ply", pts, cols)
+        if self.save_to_cwd:
+            save_ply(Path.cwd() / "eridian_cloud.ply", pts, cols)
 
     def run(self):
         _init_runtime()
@@ -690,7 +767,8 @@ class WorldMapper:
         # ── Init camera ────────────────────────────────────────────
         log.info("Initializing camera...")
         loop = not self.headless
-        self.camera = CameraCapture(video_path=self.video_path, loop=loop)
+        self.camera = CameraCapture(video_path=self.video_path, loop=loop,
+                                    camera_index=self.camera_index)
         if self.camera.cap is None:
             log.error("No camera available. Exiting.")
             return
@@ -858,7 +936,281 @@ class WorldMapper:
 
 
 # ============================================================================
-# 8. DEMO VIDEO RENDERER
+# 8. HIGH-LEVEL PYTHON API
+# ============================================================================
+@dataclasses.dataclass
+class FrameResult:
+    """Result from processing a single frame."""
+    frame: np.ndarray
+    depth: np.ndarray
+    pose: np.ndarray
+    points: np.ndarray
+    colors: np.ndarray
+    is_keyframe: bool
+    frame_index: int
+
+
+class Eridian:
+    """High-level API for monocular 3D reconstruction.
+
+    Usage::
+
+        e = Eridian()
+
+        # Single-frame depth
+        depth = e.estimate_depth(frame)
+
+        # Process a whole video
+        points, colors = e.process_video("video.mp4")
+        e.save("output.ply")
+
+        # Stream from camera
+        for result in e.stream(camera=0):
+            print(f"Frame {result.frame_index}: {len(result.points)} points")
+    """
+
+    def __init__(self):
+        self._depth_est = None
+        self._pose_est = None
+        self._cloud = PointCloud()
+        self._K = None
+        self._last_kf_pose = np.eye(4, dtype=np.float64)
+        self._frames_since_kf = 0
+        self._keyframe_count = 0
+        self._callbacks = {"on_frame": [], "on_keyframe": [], "on_depth": []}
+
+    def _ensure_depth(self):
+        if self._depth_est is None:
+            self._depth_est = DepthEstimator()
+
+    def _ensure_pose(self, width, height):
+        if self._pose_est is None:
+            fx = fy = width * 0.8
+            cx, cy = width / 2.0, height / 2.0
+            self._K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+            self._pose_est = PoseEstimator(fx, fy, cx, cy)
+
+    def _is_keyframe(self, pose):
+        self._frames_since_kf += 1
+        t_diff = np.linalg.norm(pose[:3, 3] - self._last_kf_pose[:3, 3])
+        R_diff = pose[:3, :3] @ self._last_kf_pose[:3, :3].T
+        angle = np.arccos(np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0))
+        if t_diff > 0.08 or angle > np.radians(5) or self._frames_since_kf > 15:
+            self._last_kf_pose = pose.copy()
+            self._frames_since_kf = 0
+            self._keyframe_count += 1
+            return True
+        return False
+
+    def _fire(self, event, *args):
+        for cb in self._callbacks.get(f"on_{event}", []):
+            cb(*args)
+
+    # ── Callbacks ────────────────────────────────────────────────────
+
+    def on(self, event, callback):
+        """Register a callback. Events: 'frame', 'keyframe', 'depth'.
+
+        Callback signatures:
+          frame:    fn(frame_index, frame_bgr, depth, pose)
+          keyframe: fn(frame_index, points, colors)
+          depth:    fn(frame_index, depth_map)
+
+        Returns self for chaining.
+        """
+        key = f"on_{event}"
+        if key not in self._callbacks:
+            raise ValueError(f"Unknown event '{event}'. Use: frame, keyframe, depth")
+        self._callbacks[key].append(callback)
+        return self
+
+    # ── Single-frame operations ──────────────────────────────────────
+
+    def estimate_depth(self, image):
+        """Estimate depth from a BGR image (numpy array) or file path.
+
+        Returns float32 HxW depth map in meters.
+
+        Args:
+            image: numpy array (BGR) or string/Path to an image file.
+        """
+        self._ensure_depth()
+        if isinstance(image, (str, Path)):
+            image = cv2.imread(str(image))
+            if image is None:
+                raise FileNotFoundError(f"Cannot read image: {image}")
+        return self._depth_est.estimate(image)
+
+    def frame_to_points(self, image, depth=None):
+        """Convert a single frame to 3D points in camera coordinates.
+
+        Returns (points_Nx3 float32, colors_Nx3 uint8).
+
+        Args:
+            image: BGR numpy array.
+            depth: optional precomputed depth map. Estimated if None.
+        """
+        if depth is None:
+            depth = self.estimate_depth(image)
+        h, w = depth.shape
+        self._ensure_pose(w, h)
+        fx, fy = self._K[0, 0], self._K[1, 1]
+        cx, cy = self._K[0, 2], self._K[1, 2]
+
+        ys, xs = np.mgrid[0:h:4, 0:w:4]
+        ys, xs = ys.ravel(), xs.ravel()
+        z = depth[ys, xs]
+        valid = (z > 0.2) & (z < 12.0)
+        xs, ys, z = xs[valid], ys[valid], z[valid]
+
+        x3d = (xs.astype(np.float32) - cx) * z / fx
+        y3d = (ys.astype(np.float32) - cy) * z / fy
+        pts = np.stack([x3d, y3d, z], axis=1)
+        colors = image[ys, xs][:, ::-1].copy()
+        return pts, colors
+
+    # ── Batch processing ─────────────────────────────────────────────
+
+    def process_video(self, video_path, max_frames=None):
+        """Process a video file end-to-end. Returns (points, colors).
+
+        Args:
+            video_path: path to video file.
+            max_frames: optional limit on frames to process.
+        """
+        self._ensure_depth()
+        cap = CameraCapture(video_path=str(video_path), loop=False)
+        if cap.cap is None:
+            raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+        h, w = 480, 640
+        self._ensure_pose(w, h)
+        frame_idx = 0
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+            if max_frames and frame_idx > max_frames:
+                break
+
+            depth = self._depth_est.estimate(frame)
+            self._fire("depth", frame_idx, depth)
+
+            pose, _, _ = self._pose_est.update(frame, depth=depth)
+            self._fire("frame", frame_idx, frame, depth, pose)
+
+            if self._is_keyframe(pose):
+                self._cloud.add_frame(depth, frame, pose, self._K)
+                pts, cols = self._cloud.get_data()
+                self._fire("keyframe", frame_idx, pts, cols)
+
+        cap.release()
+        return self._cloud.get_data()
+
+    # ── Camera streaming ─────────────────────────────────────────────
+
+    def stream(self, camera=0, max_frames=None):
+        """Generator that yields FrameResult for each frame from a camera.
+
+        Args:
+            camera: camera index (int) or video file path (str).
+            max_frames: optional limit.
+
+        Yields:
+            FrameResult with frame, depth, pose, accumulated points/colors.
+        """
+        self._ensure_depth()
+
+        if isinstance(camera, str):
+            cap = CameraCapture(video_path=camera, loop=False)
+        else:
+            cap = CameraCapture(camera_index=camera)
+        if cap.cap is None:
+            raise RuntimeError(f"Cannot open camera/video: {camera}")
+
+        h, w = 480, 640
+        self._ensure_pose(w, h)
+        frame_idx = 0
+
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frame_idx += 1
+                if max_frames and frame_idx > max_frames:
+                    break
+
+                depth = self._depth_est.estimate(frame)
+                self._fire("depth", frame_idx, depth)
+
+                pose, _, _ = self._pose_est.update(frame, depth=depth)
+                is_kf = self._is_keyframe(pose)
+                if is_kf:
+                    self._cloud.add_frame(depth, frame, pose, self._K)
+
+                self._fire("frame", frame_idx, frame, depth, pose)
+                if is_kf:
+                    pts, cols = self._cloud.get_data()
+                    self._fire("keyframe", frame_idx, pts, cols)
+
+                pts, cols = self._cloud.get_data()
+                yield FrameResult(
+                    frame=frame, depth=depth, pose=pose,
+                    points=pts, colors=cols,
+                    is_keyframe=is_kf, frame_index=frame_idx,
+                )
+        finally:
+            cap.release()
+
+    # ── Point cloud access ───────────────────────────────────────────
+
+    @property
+    def points(self):
+        """Current accumulated points as Nx3 float32 array."""
+        pts, _ = self._cloud.get_data()
+        return pts
+
+    @property
+    def colors(self):
+        """Current accumulated colors as Nx3 uint8 array (RGB)."""
+        _, cols = self._cloud.get_data()
+        return cols
+
+    @property
+    def point_count(self):
+        """Number of accumulated points."""
+        return self._cloud.count()
+
+    def save(self, filepath):
+        """Save current point cloud to a PLY file."""
+        pts, cols = self._cloud.get_data()
+        save_ply(filepath, pts, cols)
+
+    def load(self, filepath):
+        """Load a PLY file, replacing the current point cloud."""
+        pts, cols = load_ply(filepath)
+        with self._cloud.lock:
+            self._cloud.points = pts
+            self._cloud.colors = cols
+
+    def reset(self):
+        """Clear all accumulated data and reset pose."""
+        with self._cloud.lock:
+            self._cloud.points = np.zeros((0, 3), dtype=np.float32)
+            self._cloud.colors = np.zeros((0, 3), dtype=np.uint8)
+        self._last_kf_pose = np.eye(4, dtype=np.float64)
+        self._frames_since_kf = 0
+        self._keyframe_count = 0
+        if self._pose_est:
+            self._pose_est.pose = np.eye(4, dtype=np.float64)
+            self._pose_est.prev_pts = None
+
+
+# ============================================================================
+# 9. DEMO VIDEO RENDERER
 # ============================================================================
 import math
 
@@ -1076,8 +1428,12 @@ def cli_main():
                         help="Use test video (./data/video.mp4) instead of camera")
     parser.add_argument("--video", type=str, default=None,
                         help="Path to a video file to use as input")
+    parser.add_argument("--camera", type=int, default=None,
+                        help="Camera index to use (skip interactive picker)")
     parser.add_argument("--headless", action="store_true",
                         help="Run without GUI windows (process and save only)")
+    parser.add_argument("--save", action="store_true",
+                        help="Save PLY point cloud to current directory")
     parser.add_argument("--render", action="store_true",
                         help="Render a 4-panel demo video from input video")
     parser.add_argument("--output", type=str, default=None,
@@ -1086,6 +1442,7 @@ def cli_main():
 
     video = args.video
     headless = args.headless
+    camera_index = args.camera
 
     if args.test:
         video = str(TEST_VIDEO)
@@ -1096,7 +1453,17 @@ def cli_main():
         render_demo_video(src, args.output)
         return
 
-    mapper = WorldMapper(video_path=video, headless=headless)
+    # Interactive camera picker when no video and no camera specified
+    if not video and camera_index is None:
+        print("Scanning for cameras...")
+        cameras = probe_cameras()
+        camera_index = pick_camera(cameras)
+        if camera_index is None:
+            print("No camera selected. Use --video or --test instead.")
+            return
+
+    mapper = WorldMapper(video_path=video, headless=headless,
+                         camera_index=camera_index, save=args.save)
     mapper.run()
 
 
