@@ -67,7 +67,7 @@ def render_pointcloud_view(points, colors, frame_idx, total_frames,
         return canvas
 
     px = (rx * focal / z_shifted + width / 2).astype(np.int32)
-    py = (-ry * focal / z_shifted + height / 2).astype(np.int32)
+    py = (ry * focal / z_shifted + height / 2).astype(np.int32)
 
     # ── Depth shading: farther points are dimmer ───────────────────
     z_min, z_max = z_shifted.min(), z_shifted.max()
@@ -122,8 +122,13 @@ def main():
     in_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     log.info(f"Input: {INPUT_VIDEO.name}, {total_frames} frames @ {in_fps:.0f}fps")
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    # Use H.264 for macOS QuickTime compatibility
+    fourcc = cv2.VideoWriter_fourcc(*'avc1')
     out = cv2.VideoWriter(str(OUTPUT_PATH), fourcc, in_fps, (GRID_W, GRID_H))
+    if not out.isOpened():
+        # Fallback to mp4v if avc1 not available
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(str(OUTPUT_PATH), fourcc, in_fps, (GRID_W, GRID_H))
 
     log.info("Loading depth model...")
     depth_est = DepthEstimator()
