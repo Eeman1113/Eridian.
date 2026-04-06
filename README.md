@@ -13,7 +13,7 @@ Eridian turns any webcam into a spatial scanner. It watches what you see, unders
 
 ## Demo
 
-![Eridian 4-panel view](https://raw.githubusercontent.com/Eeman1113/Eridian./main/assets/demo_4panel.jpg)
+![Eridian 4-panel view](assets/demo_4panel.jpg)
 
 > **Top-left:** Live camera feed | **Top-right:** Metric depth map | **Bottom-left:** Optical flow tracking | **Bottom-right:** Accumulated 3D point cloud
 
@@ -27,19 +27,19 @@ Eridian takes a flat 2D video stream and reconstructs the 3D structure of the wo
 
 ### 1. Metric Depth Estimation
 
-![Depth map](https://raw.githubusercontent.com/Eeman1113/Eridian./main/assets/panel_depth.jpg)
+![Depth map](assets/panel_depth.jpg)
 
 A neural network ([Depth Anything V2 Metric](https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf)) estimates the real-world distance in meters from the camera to every single pixel in the frame. This isn't relative "closer vs farther" — it outputs actual metric depth (e.g., "this wall is 2.3 meters away"). The depth is then smoothed with a bilateral filter to reduce noise while keeping sharp edges, and temporally stabilized so it doesn't flicker between frames.
 
 ### 2. Camera Motion Tracking
 
-![Optical flow](https://raw.githubusercontent.com/Eeman1113/Eridian./main/assets/panel_features.jpg)
+![Optical flow](assets/panel_features.jpg)
 
 Eridian tracks hundreds of corner features across consecutive frames using Lucas-Kanade optical flow. Each tracked point is lifted into 3D using the depth map, creating a set of known 3D-to-2D correspondences. These are fed into a PnP (Perspective-n-Point) solver that computes exactly how the camera moved between frames — both direction and distance, in real meters. A forward-backward consistency check eliminates bad tracks before they can corrupt the pose.
 
 ### 3. Intelligent Point Cloud Accumulation
 
-![3D Point Cloud](https://raw.githubusercontent.com/Eeman1113/Eridian./main/assets/panel_pointcloud.jpg)
+![3D Point Cloud](assets/panel_pointcloud.jpg)
 
 Not every frame contributes to the 3D map. A keyframe system detects when the camera has moved enough (>8cm or >5 degrees) to justify adding new geometry. When a keyframe fires, each pixel is back-projected from 2D into 3D world coordinates using the depth and the accumulated camera pose. Three quality filters run before any point is accepted:
 
@@ -87,10 +87,10 @@ The current system is a proof of concept. The depth estimation is accurate enoug
 
 ## Pipeline at a glance
 
-![Early in the scan](https://raw.githubusercontent.com/Eeman1113/Eridian./main/assets/demo_early.jpg)
+![Early in the scan](assets/demo_early.jpg)
 *Early in the scan — depth map is active, point cloud is starting to form*
 
-![Full reconstruction](https://raw.githubusercontent.com/Eeman1113/Eridian./main/assets/demo_late.jpg)
+![Full reconstruction](assets/demo_late.jpg)
 *After scanning — dense point cloud with room geometry visible*
 
 ---

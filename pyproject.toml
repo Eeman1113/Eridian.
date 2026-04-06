@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eridian"
-version = "0.1.1"
+version = "0.1.2"
 description = "Real-time 3D world reconstruction from a single camera"
-readme = "README.md"
+readme = {file = "README.md", content-type = "text/markdown; charset=UTF-8; variant=GFM"}
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Eeman Majumder" }]
