@@ -616,6 +616,7 @@ def save_ply(filepath, points, colors):
     data['g'] = colors[:, 1]
     data['b'] = colors[:, 2]
 
+    Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     with open(str(filepath), 'wb') as f:
         f.write(header.encode('ascii'))
         f.write(data.tobytes())
