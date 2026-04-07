@@ -585,11 +585,15 @@ class PointCloud:
 # 5. PLY EXPORT
 # ============================================================================
 def save_ply(filepath, points, colors):
-    """Save point cloud as binary PLY."""
+    """Save point cloud as binary PLY (camera POV: Y-up)."""
     n = len(points)
     if n == 0:
         log.warning("No points to save")
         return
+
+    # Flip Y axis so the PLY is right-side-up (camera convention is Y-down)
+    points = points.copy()
+    points[:, 1] = -points[:, 1]
 
     header = (
         "ply\n"
