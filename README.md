@@ -126,6 +126,7 @@ eridian --camera 0         # use specific camera index
 eridian --test             # run on test video
 eridian --video v.mp4      # any video file
 eridian --save             # save PLY to current directory on exit
+eridian --savedir ~/Downloads    # save PLY files to a custom directory
 eridian --render --video v.mp4   # render 4-panel demo video
 ```
 
@@ -279,6 +280,7 @@ points, colors = cloud.get_data()
 | `--camera N` | Use camera index N (skip interactive picker) |
 | `--headless` | No GUI windows, process and save only |
 | `--save` | Save PLY to current working directory on exit |
+| `--savedir DIR` | Save PLY files to a custom directory (default: `./splat/`) |
 | `--render` | Render a 4-panel demo video from input |
 | `--output PATH` | Output path for rendered video |
 
@@ -294,9 +296,9 @@ points, colors = cloud.get_data()
 
 | Path | What |
 |------|------|
-| `splat/cloud_latest.ply` | Latest point cloud (saved every 10s) |
-| `splat/cloud_YYYYMMDD_HHMMSS.ply` | Timestamped backups (every 60s) |
-| `splat/cloud_final_*.ply` | Final save on shutdown |
+| `splat/cloud_latest.ply` | Latest point cloud (saved every 10s, or `--savedir`) |
+| `splat/cloud_YYYYMMDD_HHMMSS.ply` | Timestamped backups (every 60s, or `--savedir`) |
+| `splat/cloud_final_*.ply` | Final save on shutdown (or `--savedir`) |
 | `splat/depth_frames/*.png` | 16-bit metric depth maps (every 5th frame) |
 | `output_video/eridian_demo.mp4` | 4-panel demo video |
 | `logs/mapper.log` | Full application log |
