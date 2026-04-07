@@ -703,7 +703,7 @@ class Visualizer3D:
 class WorldMapper:
     """Main loop with keyframe-based accumulation."""
 
-    def __init__(self, video_path=None, headless=False, camera_index=None, save=False):
+    def __init__(self, video_path=None, headless=False, camera_index=None, save=False, savedir=None):
         self.running = True
         self.camera = None
         self.depth_estimator = None
@@ -714,6 +714,7 @@ class WorldMapper:
         self.headless = headless
         self.camera_index = camera_index
         self.save_to_cwd = save
+        self.savedir = Path(savedir) if savedir else None
 
         # Timing
         self.last_save = time.time()
@@ -753,9 +754,11 @@ class WorldMapper:
         pts, cols = self.cloud.get_data()
         if len(pts) == 0:
             return
-        save_ply(SPLAT_DIR / "cloud_latest.ply", pts, cols)
+        out = self.savedir if self.savedir else SPLAT_DIR
+        out.mkdir(parents=True, exist_ok=True)
+        save_ply(out / "cloud_latest.ply", pts, cols)
         if tag:
-            save_ply(SPLAT_DIR / f"cloud_{tag}.ply", pts, cols)
+            save_ply(out / f"cloud_{tag}.ply", pts, cols)
         if self.save_to_cwd:
             save_ply(Path.cwd() / "eridian_cloud.ply", pts, cols)
 
@@ -1439,6 +1442,8 @@ def cli_main():
                         help="Render a 4-panel demo video from input video")
     parser.add_argument("--output", type=str, default=None,
                         help="Output path for rendered video (used with --render)")
+    parser.add_argument("--savedir", type=str, default=None,
+                        help="Directory to save PLY point clouds (default: ./splat/)")
     args = parser.parse_args()
 
     video = args.video
@@ -1464,7 +1469,8 @@ def cli_main():
             return
 
     mapper = WorldMapper(video_path=video, headless=headless,
-                         camera_index=camera_index, save=args.save)
+                         camera_index=camera_index, save=args.save,
+                         savedir=args.savedir)
     mapper.run()
 
 
