@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eridian"
-version = "0.1.7"
+version = "0.3.0"
 description = "Real-time 3D world reconstruction from a single camera"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 authors = [{ name = "Eeman Majumder" }]
-keywords = ["3d", "depth-estimation", "point-cloud", "monocular", "reconstruction", "slam"]
+keywords = ["3d", "depth-estimation", "point-cloud", "monocular", "reconstruction", "slam", "gct"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Topic :: Scientific/Engineering :: Image Processing",
@@ -24,7 +24,18 @@ dependencies = [
     "transformers",
     "pyvista",
     "pillow",
+    "timm",
+    # GCT backend (LingBot-MAP) deps
+    "huggingface_hub",
+    "einops",
+    "safetensors",
+    "scipy",
+    "torchvision",
+    "tqdm",
 ]
+
+[project.optional-dependencies]
+gct-vis = ["viser>=0.2.23", "trimesh", "matplotlib"]
 
 [project.scripts]
 eridian = "eridian.main:cli_main"
@@ -33,6 +44,7 @@ eridian = "eridian.main:cli_main"
 Homepage = "https://github.com/Eeman1113/Eridian."
 Repository = "https://github.com/Eeman1113/Eridian."
 Documentation = "https://github.com/Eeman1113/Eridian./wiki"
+"GCT Model (LingBot-MAP)" = "https://github.com/Robbyant/lingbot-map"
 
 [tool.setuptools.packages.find]
 include = ["eridian*"]

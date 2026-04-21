@@ -4,3 +4,11 @@ torch
 transformers
 pyvista
 pillow
+timm
+# GCT backend (LingBot-MAP) dependencies
+huggingface_hub
+einops
+safetensors
+scipy
+torchvision
+tqdm
