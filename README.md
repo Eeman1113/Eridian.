@@ -8,7 +8,7 @@ Eridian turns any webcam into a spatial scanner. It watches what you see, unders
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
-[![Wiki](https://img.shields.io/badge/docs-Wiki-blue)](https://github.com/Eeman1113/Eridian./wiki)
+[![Docs](https://img.shields.io/badge/docs-Wiki-blue)](https://github.com/Eeman1113/Eridian./tree/main/docs)
 
 ---
 
@@ -112,6 +112,27 @@ The software side is the foundation everything else gets built on:
 
 ![Full reconstruction](https://github.com/Eeman1113/Eridian./raw/main/assets/demo_late.jpg)
 *After scanning — dense point cloud with room geometry visible*
+
+---
+
+## Two Backends
+
+Eridian ships with two reconstruction backends — pick the one that fits your use case:
+
+| | **Classic** (default) | **LingBot-MAP (GCT)** |
+|---|---|---|
+| **How it works** | Depth Anything V2 + optical flow + PnP | Single transformer predicts pose, depth, and 3D points jointly |
+| **Input** | Webcam or video | Video file (camera streaming coming soon) |
+| **Real-time** | Yes (~5 FPS on Apple M-series) | Not yet — batch processes video |
+| **Hardware** | CPU / MPS, no GPU required | MPS / CUDA, ~4 GB VRAM |
+| **Best for** | Live scanning, interactive use | High-quality offline 3D maps of environments |
+| **Output** | Colored PLY point cloud | Colored PLY point cloud |
+
+### When to use LingBot-MAP
+
+The GCT (Geometric Context Transformer) backend from [LingBot-MAP](https://github.com/Robbyant/lingbot-map) replaces the entire classic pipeline with a single transformer model. Instead of running separate depth estimation, feature tracking, and pose solving steps, GCT processes all frames through one network that jointly understands camera motion and scene geometry.
+
+This makes it significantly better for **mapping a full environment** — walk through a room, hallway, or outdoor space with your phone camera, then feed the video to Eridian GCT to get a dense, accurate 3D map.
 
 ---
 
@@ -271,7 +292,95 @@ points, colors = cloud.get_data()
 - A webcam (built-in, USB, or macOS Continuity Camera) — or a video file for test mode
 - CPU-only — no CUDA needed (uses Apple MPS when available)
 
+## 3D Environment Mapping with LingBot-MAP
+
+This is the main workflow for building a real 3D map of a physical space.
+
+### Step 1: Record a video
+
+Walk slowly through the space you want to map. Use your phone or any camera. Tips:
+- **Move slowly and steadily** — fast motion causes blur
+- **Overlap** — make sure consecutive frames share visible geometry
+- **Cover the space** — walk the full perimeter and through the center
+- **Lighting** — even lighting works best, avoid pointing at bright windows
+- 30-60 seconds of video is enough for a room; longer for larger spaces
+
+### Step 2: Get the GCT checkpoint
+
+Download the LingBot-MAP model weights from [the official repo](https://github.com/Robbyant/lingbot-map):
+
+```bash
+# Example — check the LingBot-MAP repo for the latest checkpoint URL
+wget -O gct_checkpoint.pt <checkpoint-url>
+```
+
+### Step 3: Run Eridian in GCT mode
+
+```bash
+# Basic — reconstruct from video
+eridian --gct --gct-model gct_checkpoint.pt --video room_scan.mp4
+
+# Save output to a specific directory
+eridian --gct --gct-model gct_checkpoint.pt --video room_scan.mp4 --savedir ~/3d_maps/
+
+# Higher quality — keep more points, less subsampling
+eridian --gct --gct-model gct_checkpoint.pt --video room_scan.mp4 \
+    --gct-conf 1.0 --gct-subsample 2
+
+# Faster — process fewer frames
+eridian --gct --gct-model gct_checkpoint.pt --video room_scan.mp4 \
+    --gct-fps 5 --gct-max-frames 100
+```
+
+### Step 4: View your 3D map
+
+The output is a `.ply` point cloud file. Open it in:
+- [MeshLab](https://www.meshlab.net/) — free, lightweight
+- [CloudCompare](https://www.danielgm.net/cc/) — free, powerful measurement tools
+- Blender — File > Import > PLY
+
+### Python API (GCT)
+
+```python
+from eridian.gct_backend import GCTReconstructor, gct_to_pointcloud
+from eridian import save_ply
+
+# Load model
+gct = GCTReconstructor(model_path="gct_checkpoint.pt")
+
+# Reconstruct from video
+result = gct.reconstruct_video("room_scan.mp4", fps=10)
+
+# Extract colored point cloud
+points, colors = gct_to_pointcloud(result, conf_threshold=1.5, subsample=4)
+
+# Save
+save_ply("room_map.ply", points, colors)
+print(f"{len(points):,} points")
+
+# Access per-frame data
+print(f"Frames processed: {result['num_frames']}")
+print(f"Depth maps shape: {result['depth'].shape}")        # [N, H, W]
+print(f"Camera poses shape: {result['extrinsic'].shape}")   # [N, 3, 4]
+print(f"World points shape: {result['world_points'].shape}")# [N, H, W, 3]
+```
+
+You can also reconstruct from a list of frames directly:
+
+```python
+import cv2
+
+frames = [cv2.imread(f"frame_{i:04d}.jpg") for i in range(50)]
+result = gct.reconstruct_frames(frames, keyframe_interval=1)
+points, colors = gct_to_pointcloud(result)
+save_ply("map.ply", points, colors)
+```
+
+---
+
 ## CLI Reference
+
+### Classic mode
 
 | Flag | Description |
 |------|-------------|
@@ -283,6 +392,22 @@ points, colors = cloud.get_data()
 | `--savedir DIR` | Save PLY files to a custom directory (default: `./splat/`) |
 | `--render` | Render a 4-panel demo video from input |
 | `--output PATH` | Output path for rendered video |
+| `--model small\|base\|large` | Depth model size (default: small) |
+
+### GCT mode (LingBot-MAP)
+
+| Flag | Description |
+|------|-------------|
+| `--gct` | Enable GCT transformer backend |
+| `--gct-model PATH` | Path to GCT checkpoint (.pt file) |
+| `--gct-fps N` | Frame sampling rate from video (default: 10) |
+| `--gct-max-frames N` | Max frames to process |
+| `--gct-scale-frames N` | Scale estimation frames (default: 8) |
+| `--gct-window N` | KV cache sliding window size (default: 64) |
+| `--gct-conf FLOAT` | Confidence threshold for points (default: 1.5) |
+| `--gct-subsample N` | Spatial subsampling factor (default: 4, lower = denser) |
+| `--gct-image-size N` | Input resolution (default: 518) |
+| `--gct-keyframe-interval N` | KV cache keyframe interval (auto if unset) |
 
 ## Controls
 
@@ -294,6 +419,7 @@ points, colors = cloud.get_data()
 
 ## Output files
 
+### Classic mode
 | Path | What |
 |------|------|
 | `splat/cloud_latest.ply` | Latest point cloud (saved every 10s, or `--savedir`) |
@@ -303,9 +429,15 @@ points, colors = cloud.get_data()
 | `output_video/eridian_demo.mp4` | 4-panel demo video |
 | `logs/mapper.log` | Full application log |
 
+### GCT mode
+| Path | What |
+|------|------|
+| `splat/gct_cloud.ply` | Reconstructed 3D point cloud (or `--savedir`) |
+| `eridian_gct_cloud.ply` | Copy in working directory (with `--save`) |
+
 ## Architecture
 
-Single `main.py`, no external config, no separate processes:
+### Classic pipeline
 
 ```
 CameraCapture        — OpenCV with auto-reconnect + video fallback
@@ -316,6 +448,19 @@ Visualizer3D         — PyVista non-blocking renderer
 save_ply()           — Binary PLY writer
 WorldMapper          — Main loop with keyframe system
 ```
+
+### GCT pipeline (LingBot-MAP)
+
+```
+GCTReconstructor     — Loads and runs the GCT transformer model
+ ├─ AggregatorStream — DINOv2 ViT backbone + causal temporal attention
+ ├─ CameraHead       — Iterative camera pose prediction (translation + rotation + FOV)
+ ├─ DPTHead          — Dense depth + 3D world point prediction with confidence
+ └─ KV Cache         — Sliding window memory for streaming inference
+gct_to_pointcloud()  — Confidence filtering + color extraction → PLY-ready arrays
+```
+
+The GCT model jointly predicts camera pose, metric depth, and 3D world coordinates in a single forward pass — no separate tracking or pose estimation needed.
 
 ## Depth model fallback chain
 
