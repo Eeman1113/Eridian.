@@ -14,11 +14,31 @@ Eridian turns any webcam into a spatial scanner. It watches what you see, unders
 
 ## Demo
 
+### Classic Pipeline — Real-time 4-panel view
+
 ![Eridian 4-panel view](https://github.com/Eeman1113/Eridian./raw/main/assets/demo_4panel.jpg)
 
 > **Top-left:** Live camera feed | **Top-right:** Metric depth map | **Bottom-left:** Optical flow tracking | **Bottom-right:** Accumulated 3D point cloud
 
 https://github.com/Eeman1113/Eridian./raw/main/output_video/eridian_demo.mp4
+
+### Model Comparison — Small vs Base vs Large
+
+https://github.com/Eeman1113/Eridian./raw/main/output_video/demo_small.mp4
+
+https://github.com/Eeman1113/Eridian./raw/main/output_video/demo_base.mp4
+
+https://github.com/Eeman1113/Eridian./raw/main/output_video/demo_large.mp4
+
+### LingBot-MAP (GCT) — Environment Reconstruction
+
+![GCT comparison — source frame vs 3D point cloud from two angles](https://github.com/Eeman1113/Eridian./raw/main/assets/gct_demo_comparison.png)
+
+> **Left:** Source video frame | **Center:** GCT 3D cloud (front) | **Right:** GCT 3D cloud (60 deg) — 761,460 points from 20 frames on Apple M4 MPS
+
+![GCT multi-angle render](https://github.com/Eeman1113/Eridian./raw/main/assets/gct_demo_render.png)
+
+> GCT (LingBot-MAP) dense point cloud rendered from 4 viewing angles
 
 ---
 
